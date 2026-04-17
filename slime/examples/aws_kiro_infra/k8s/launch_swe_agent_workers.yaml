@@ -1,0 +1,125 @@
+# =============================================================================
+# CPU worker pool — mini-swe-agent + dockerd + FastAPI
+# =============================================================================
+# Mirrors Kiro's launch_kos_only_async.yaml but:
+#   * KoS FastAPI (Strands agent) → aws_kiro_infra.server.swe_agent_server
+#     (mini-swe-agent scaffold runs IN-PROCESS on this pod)
+#   * image → a slime+swe-rl+docker+transformers image (privileged for DinD)
+#   * URL registry file renamed: kos_servers.env → swe_agents.env
+#
+# Reads:  <OUTPUT_DIR>/<SGLANG_RUN_NAME>/sglang_external_rollout.env  (SGLang job)
+# Writes: <OUTPUT_DIR>/<RUN_NAME>/swe_agents.env                      (each pod appends)
+#
+# NOTE: each pod loads the tokenizer locally from ${MODEL_PATH} so the
+#       trainer gets byte-perfect per-turn token_ids back.
+# NOTE: one CPU worker pool serves BOTH 4B and 30B trainers — set MODEL_PATH
+#       to whichever run is active. You can deploy two CPU pools if running
+#       4B and 30B simultaneously (change RUN_NAME + MODEL_PATH).
+# =============================================================================
+apiVersion: "kubeflow.org/v1"
+kind: "PyTorchJob"
+metadata:
+  name: swerl-swe-agent-workers
+  namespace: hyperpod-ns-aladdin
+  labels:
+    kueue.x-k8s.io/queue-name: hyperpod-ns-aladdin-localqueue
+    kueue.x-k8s.io/priority-class: high-p5-priority
+spec:
+  pytorchReplicaSpecs:
+    Worker:
+      replicas: 4                               # Scale up for more rollout concurrency
+      restartPolicy: OnFailure
+      template:
+        metadata:
+          labels:
+            kueue.x-k8s.io/queue-name: hyperpod-ns-aladdin-localqueue
+            kueue.x-k8s.io/priority-class: high-p5-priority
+        spec:
+          serviceAccountName: bedrock-sa
+          nodeSelector:
+            beta.kubernetes.io/instance-type: ml.m5.24xlarge   # CPU pool (96 vCPU, 384 GB RAM)
+            sagemaker.amazonaws.com/node-health-status: Schedulable
+          containers:
+          - name: pytorch
+            image: 975050351917.dkr.ecr.us-east-2.amazonaws.com/q-codegen:swerl-aws-kiro-0.1.0
+            imagePullPolicy: Always
+            securityContext:
+              privileged: true                  # ★ required for in-pod dockerd
+            command: ["bash", "-c"]
+            args:
+              - |
+                set -o pipefail
+                set -x
+
+                LOG_DIR="/mnt_out/${USER:-default}/logs/swerl-aws-kiro/swe_agents/${RUN_NAME}"
+                mkdir -p "${LOG_DIR}/logs"
+                LOG_FILE="${LOG_DIR}/logs/$(hostname)_$(date +%Y%m%d_%H%M%S).log"
+
+                rm -rf /dev/shm/containerd /dev/shm/containers /dev/shm/docker_data
+                rm -rf /dev/shm/buildkit /dev/shm/rootfs /dev/shm/volumes
+                rm -rf /dev/shm/plugins /dev/shm/network /dev/shm/swarm
+                rm -rf /dev/shm/tmp /dev/shm/runtimes
+                rm -f /dev/shm/engine-id /dev/shm/nccl-*
+
+                bash ${AWS_KIRO_DIR}/scripts/launch_swe_agent_workers_cpu.sh \
+                  --sglang-env-file         "${SGLANG_ENV_BASE}/${SGLANG_RUN_NAME}/sglang_external_rollout.env" \
+                  --model-path              "${MODEL_PATH}" \
+                  --agent-port              "${AGENT_PORT}" \
+                  --agent-max-concurrent    "${AGENT_MAX_CONCURRENT}" \
+                  --run-name                "${RUN_NAME}" \
+                  --output-dir              "${OUTPUT_DIR}" \
+                  --aws-kiro-dir            "${AWS_KIRO_DIR}" \
+                  --swe-docker-images       "${SWE_DOCKER_IMAGES_PATH}" \
+                  2>&1 | tee "${LOG_FILE}"
+
+                echo "Agent server exited; sleeping for inspection"
+                sleep infinity
+            env:
+            # --- SGLang coordination (must match SGLang job's RUN_NAME) ---
+            - name: SGLANG_ENV_BASE
+              value: "/mnt_out/jinxiaolong/logs/swerl-aws-kiro"
+            - name: SGLANG_RUN_NAME
+              value: "swerl_4b_sglang"          # ← set to 30B RUN_NAME when 30B active
+            # --- Model path (for local tokenizer; must match the SGLang-served model) ---
+            - name: MODEL_PATH
+              value: "/mnt_out/jinxiaolong/models/Qwen3-4B-Instruct-2507"
+            # --- Worker server ---
+            - name: AGENT_PORT
+              value: "5000"
+            - name: AGENT_MAX_CONCURRENT
+              value: "16"
+            # --- Paths ---
+            - name: RUN_NAME
+              value: "swerl_swe_agents"
+            - name: OUTPUT_DIR
+              value: "/mnt_out/jinxiaolong/logs/swerl-aws-kiro"
+            - name: AWS_KIRO_DIR
+              value: "/mnt_out/jinxiaolong/codebase/slime/examples/aws_kiro_infra"
+            # --- SWE-Bench Docker images dir (offline tarball load) ---
+            - name: SWE_DOCKER_IMAGES_PATH
+              value: "/mnt_out/jinxiaolong/data/sweap_images_800/"
+            # --- Container limits (honored by docker_ops on each spawned SWE container) ---
+            - name: SWE_CONTAINER_MEMORY
+              value: "8g"
+            - name: SWE_CONTAINER_PIDS_LIMIT
+              value: "1024"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            volumeMounts:
+            - mountPath: /mnt_out
+              name: private-model-rw-volume
+            - mountPath: /mnt_private
+              name: private-data-ro-volume
+            - mountPath: /dev/shm
+              name: shm
+          volumes:
+          - name: private-model-rw-volume
+            persistentVolumeClaim:
+              claimName: private-model-rw
+          - name: private-data-ro-volume
+            persistentVolumeClaim:
+              claimName: private-data-rw
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 180Gi

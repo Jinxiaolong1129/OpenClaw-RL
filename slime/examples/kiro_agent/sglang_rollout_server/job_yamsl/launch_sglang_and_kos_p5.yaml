@@ -1,0 +1,143 @@
+apiVersion: "kubeflow.org/v1"
+kind: "PyTorchJob"
+metadata:
+  name: myshang-slime-sglang-kos-0212
+  namespace: hyperpod-ns-aladdin
+  labels:
+    kueue.x-k8s.io/queue-name: hyperpod-ns-aladdin-localqueue
+    kueue.x-k8s.io/priority-class: high-p5-priority
+spec:
+  pytorchReplicaSpecs:
+    Worker:
+      replicas: 4
+      restartPolicy: OnFailure
+      template:
+        metadata:
+          labels:
+            kueue.x-k8s.io/queue-name: hyperpod-ns-aladdin-localqueue
+            kueue.x-k8s.io/priority-class: high-p5-priority
+        spec:
+          serviceAccountName: bedrock-sa
+          nodeSelector:
+            beta.kubernetes.io/instance-type: ml.p5.48xlarge
+            sagemaker.amazonaws.com/node-health-status: Schedulable
+            sagemaker.amazonaws.com/deep-health-check-status: Passed
+          containers:
+          - name: pytorch
+            image: 975050351917.dkr.ecr.us-east-2.amazonaws.com/q-codegen:myshang-slime-0.2.2-kos-0211
+            imagePullPolicy: Always
+            securityContext:
+              privileged: true
+            command: ["bash", "-c"]
+            args:
+              - |
+                set -o pipefail
+                set -x
+
+                LOG_DIR="/mnt_out/myshang/logs/slime/kos/${RUN_NAME}"
+                mkdir -p "${LOG_DIR}/logs"
+                HOSTNAME=$(hostname)
+                LOG_FILE="${LOG_DIR}/logs/${HOSTNAME}_$(date +%Y%m%d_%H%M%S).log"
+                echo "Logging to: ${LOG_FILE}"
+
+                bash ${SLIME_DIR}/examples/kiro_agent/sglang_rollout_server/launch_sglang_and_kos.sh \
+                  --model-path "${MODEL_PATH}" \
+                  --tp-size "${TP_SIZE}" \
+                  --mem-fraction "${MEM_FRACTION}" \
+                  --router-port "${ROUTER_PORT}" \
+                  --run-name "${RUN_NAME}" \
+                  --output-dir /mnt_out/myshang/logs/slime \
+                  --slime-dir "${SLIME_DIR}" \
+                  --kos-home "${KOS_HOME}" \
+                  --kos-workspace-path "${KOS_WORKSPACE_PATH}" \
+                  --kos-swe-docker-images "${KOS_SWE_DOCKER_IMAGES}" \
+                  --kos-num-workers "${KOS_NUM_WORKERS}" \
+                  --kos-max-iterations "${KOS_MAX_ITERATIONS}" \
+                  --kos-timeout "${KOS_TIMEOUT}" \
+                  2>&1 | tee "${LOG_FILE}"
+
+                # Keep container alive even if the script exits, to avoid CrashLoopBackOff
+                # while debugging. Remove this for production.
+                echo "Script exited with code $?. Sleeping to keep pod alive for debugging."
+                sleep infinity
+            env:
+            # --- SGLang ---
+            - name: MODEL_PATH
+              value: "/mnt_out/myshang/models/qwen/Qwen3-Coder-30B-A3B-Instruct"
+            - name: TP_SIZE
+              value: "8"
+            - name: MEM_FRACTION
+              value: "0.6"
+            - name: ROUTER_PORT
+              value: "30000"
+            # --- KoS ---
+            - name: KOS_HOME
+              value: "/mnt_out/myshang/codebase/Kiro-on-Strands"
+            - name: KOS_WORKSPACE_PATH
+              value: "/mnt_private/zhenghuj/crux_0314_java_srctest_300_lines/crux_0318_java_9k_workspace/"
+            - name: KOS_SWE_DOCKER_IMAGES
+              value: "/mnt_out/zhenghuj/docker_images/sweap_images_800/"
+            - name: KOS_NUM_WORKERS
+              value: "4"
+            - name: KOS_MAX_ITERATIONS
+              value: "30"
+            - name: KOS_TIMEOUT
+              value: "3600"
+            - name: SKIP_TEST_EXECUTION
+              value: "1"
+            # --- General ---
+            - name: RUN_NAME
+              value: "smoke_test"
+            - name: SLIME_DIR
+              value: "/mnt_out/myshang/codebase/slime"
+            - name: NCCL_TIMEOUT
+              value: "12000"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            resources:
+              limits:
+                nvidia.com/gpu: "8"
+                vpc.amazonaws.com/efa: "32"
+              requests:
+                nvidia.com/gpu: "8"
+                vpc.amazonaws.com/efa: "32"
+            volumeMounts:
+            - mountPath: /mnt
+              name: public-data-ro-volume
+            - mountPath: /mnt_out
+              name: private-model-rw-volume
+            - mountPath: /mnt_private
+              name: private-data-ro-volume
+            - mountPath: /mnt_agi_data
+              name: olympus-pretraining-ro-volume
+            - mountPath: /mnt_agi_cons
+              name: agi-cons-ro-volume
+            - mountPath: /dev/shm
+              name: shm
+            - mountPath: /var/log/aws/clusters
+              name: aws-clusters-logs
+              readOnly: true
+          volumes:
+          - name: public-data-ro-volume
+            persistentVolumeClaim:
+              claimName: public-data-ro
+          - name: private-model-rw-volume
+            persistentVolumeClaim:
+              claimName: private-model-rw
+          - name: private-data-ro-volume
+            persistentVolumeClaim:
+              claimName: private-data-rw
+          - name: olympus-pretraining-ro-volume
+            persistentVolumeClaim:
+              claimName: olympus-pretraining-ro
+          - name: agi-cons-ro-volume
+            persistentVolumeClaim:
+              claimName: agi-cons-ro
+          - hostPath:
+              path: /dev/shm
+              type: Directory
+            name: shm
+          - hostPath:
+              path: /var/log/aws/clusters
+              type: DirectoryOrCreate
+            name: aws-clusters-logs

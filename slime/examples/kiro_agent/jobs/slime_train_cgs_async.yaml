@@ -1,0 +1,211 @@
+apiVersion: "kubeflow.org/v1"
+kind: "PyTorchJob"
+metadata:
+  name: yawenwuu-slime-cgs-train
+  namespace: hyperpod-ns-aladdin
+  labels:
+    kueue.x-k8s.io/queue-name: hyperpod-ns-aladdin-localqueue
+    kueue.x-k8s.io/priority-class: high-p5-priority
+spec:
+  pytorchReplicaSpecs:
+    Worker:
+      replicas: 16
+      restartPolicy: OnFailure
+      template:
+        metadata:
+          labels:
+            kueue.x-k8s.io/queue-name: hyperpod-ns-aladdin-localqueue
+            kueue.x-k8s.io/priority-class: high-p5-priority
+        spec:
+          serviceAccountName: bedrock-sa
+          nodeSelector:
+            beta.kubernetes.io/instance-type: ml.p5.48xlarge
+            sagemaker.amazonaws.com/node-health-status: Schedulable
+            sagemaker.amazonaws.com/deep-health-check-status: Passed
+          containers:
+          - name: pytorch
+            image: 975050351917.dkr.ecr.us-east-2.amazonaws.com/q-codegen:myshang-slime-0.2.2-kos-mlflow
+            imagePullPolicy: Always
+            securityContext:
+              privileged: true
+            command: ["bash", "-c"]
+            args:
+              - |
+                set -ex
+
+                # =============================================================
+                # Disaggregated deployment: trainer reads from both
+                #   1. sglang_external_rollout.env (GPU nodes — SGLang engines)
+                #   2. kos_servers.env             (CPU nodes — KoS CGS servers)
+                # =============================================================
+
+                SGLANG_ENV_FILE="${SGLANG_ENV_BASE}/${SGLANG_RUN_NAME}/sglang_external_rollout.env"
+                KOS_ENV_FILE="${SGLANG_ENV_BASE}/${KOS_RUN_NAME}/kos_servers.env"
+
+                # --- Wait for SGLang env file (GPU nodes) ---
+                echo "Waiting for SGLang env file: ${SGLANG_ENV_FILE}"
+                WAITED=0
+                while [ ! -f "${SGLANG_ENV_FILE}" ]; do
+                  if [ "$WAITED" -ge 1800 ]; then
+                    echo "ERROR: Timeout waiting for SGLang env file (1800s)"
+                    exit 1
+                  fi
+                  sleep 10
+                  WAITED=$((WAITED + 10))
+                  [ $((WAITED % 60)) -eq 0 ] && echo "  Still waiting for SGLang GPU nodes... (${WAITED}s)"
+                done
+                echo "Found SGLang env file:"
+                cat "${SGLANG_ENV_FILE}"
+
+                # --- Wait for KoS env file (CPU nodes) ---
+                echo "Waiting for KoS env file: ${KOS_ENV_FILE}"
+                WAITED=0
+                while [ ! -f "${KOS_ENV_FILE}" ]; do
+                  if [ "$WAITED" -ge 1800 ]; then
+                    echo "ERROR: Timeout waiting for KoS env file (1800s)"
+                    exit 1
+                  fi
+                  sleep 10
+                  WAITED=$((WAITED + 10))
+                  [ $((WAITED % 60)) -eq 0 ] && echo "  Still waiting for KoS CPU nodes... (${WAITED}s)"
+                done
+                echo "Found KoS env file:"
+                cat "${KOS_ENV_FILE}"
+
+                # Source KoS env so KOS_REMOTE_URLS is set before the train script
+                source "${KOS_ENV_FILE}"
+                export KOS_REMOTE_URLS="${KOS_REMOTE_URLS}"
+                echo "KOS_REMOTE_URLS=${KOS_REMOTE_URLS}"
+
+                # --- Cleanup /dev/shm ---
+                echo "Cleaning up /dev/shm..."
+                rm -rf /dev/shm/containerd /dev/shm/containers /dev/shm/docker_data
+                rm -rf /dev/shm/buildkit /dev/shm/rootfs /dev/shm/volumes
+                rm -rf /dev/shm/plugins /dev/shm/network /dev/shm/swarm
+                rm -rf /dev/shm/tmp /dev/shm/runtimes
+                rm -f /dev/shm/engine-id /dev/shm/nccl-*
+
+                # --- Launch CGS training ---
+                LOG_DIR="/mnt_out/yawenwuu/logs/slime/trainer/${RUN_NAME}"
+                mkdir -p "${LOG_DIR}/logs"
+                HOSTNAME=$(hostname)
+                LOG_FILE="${LOG_DIR}/logs/${HOSTNAME}_$(date +%Y%m%d_%H%M%S).log"
+                echo "Logging to: ${LOG_FILE}"
+                bash ${SLIME_DIR}/examples/kiro_agent/run-qwen3-30b-kiro-kos-cgs-async.sh 2>&1 | tee "${LOG_FILE}"
+            env:
+            - name: NCCL_TIMEOUT
+              value: "12000"
+            - name: MODEL_PATH
+              value: "/mnt_out/yawenwuu/models/qwen/Qwen3-Coder-30B-A3B-Instruct"
+            - name: ROUTER_PORT
+              value: "30000"
+            - name: MAX_TOTAL_TOKENS
+              value: "131072"
+            - name: SLIME_DIR
+              value: "/mnt_out/yawenwuu/packages/rl_test_repo/slime"
+            - name: LOG_DIR
+              value: "/mnt_out/yawenwuu/logs/slime"
+            # --- Run names: must match the SGLang + KoS job's RUN_NAME ---
+            - name: RUN_NAME
+              value: "cgs_async"
+            - name: SGLANG_RUN_NAME
+              value: "sglang_server_cgs"
+            - name: KOS_RUN_NAME
+              value: "kos_cgs_server"
+            - name: SGLANG_ENV_BASE
+              value: "/mnt_out/yawenwuu/logs/slime"
+            # --- KoS (URLs come from kos_servers.env, not derived from SGLang) ---
+            - name: KOS_TIMEOUT
+              value: "1800"
+            - name: TRAJECTORY_FOLDER
+              value: "/mnt_out/yawenwuu/logs/slime/trajectory_folder"
+            # --- CGS reward shaping (passed through to Ray workers via RUNTIME_ENV_JSON) ---
+            # Match VeRL v4-12-0-1: GRPO with std normalization, no advantage scaling
+            - name: CGS_GRPO_STD_NORMALIZATION
+              value: "true"
+            - name: CGS_MIN_REWARD_THRESHOLD
+              value: "0.2"
+            - name: UPDATE_WEIGHTS_INTERVAL
+              value: "1"
+            # --- Performance / Parallelism ---
+            - name: TENSOR_MODEL_PARALLEL_SIZE
+              value: "4"
+            - name: PIPELINE_MODEL_PARALLEL_SIZE
+              value: "2"
+            - name: CONTEXT_PARALLEL_SIZE
+              value: "8"
+            - name: EXPERT_MODEL_PARALLEL_SIZE
+              value: "8"
+            - name: RECOMPUTE_GRANULARITY
+              value: "full"
+            - name: RECOMPUTE_METHOD
+              value: "uniform"
+            - name: RECOMPUTE_NUM_LAYERS
+              value: "1"
+            - name: USE_DYNAMIC_BATCH_SIZE
+              value: "true"
+            - name: MAX_TOKENS_PER_GPU
+              value: "32768"
+            - name: LOG_PROBS_MAX_TOKENS_PER_GPU
+              value: "65536"
+            - name: LOG_PROBS_CHUNK_SIZE
+              value: "512"
+            - name: MLFLOW_TRACKING_URI
+              value: arn:aws:sagemaker:us-east-1:605134433731:mlflow-tracking-server/aladdin-iad
+            - name: TRACKING_SERVER_URI
+              value: arn:aws:sagemaker:us-east-1:605134433731:mlflow-tracking-server/aladdin-iad
+            - name: MLFLOW_EXPERIMENT_NAME
+              value: "slime-kos-cgs-async"
+            - name: MLFLOW_RUN_NAME
+              value: "qwen3-30b-kos-cgs"
+            - name: PYTORCH_ALLOC_CONF
+              value: "expandable_segments:True"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            resources:
+              limits:
+                nvidia.com/gpu: "8"
+                vpc.amazonaws.com/efa: "32"
+              requests:
+                nvidia.com/gpu: "8"
+                vpc.amazonaws.com/efa: "32"
+            volumeMounts:
+            - mountPath: /mnt
+              name: public-data-ro-volume
+            - mountPath: /mnt_out
+              name: private-model-rw-volume
+            - mountPath: /mnt_private
+              name: private-data-ro-volume
+            - mountPath: /mnt_agi_data
+              name: olympus-pretraining-ro-volume
+            - mountPath: /mnt_agi_cons
+              name: agi-cons-ro-volume
+            - mountPath: /dev/shm
+              name: shm
+            - mountPath: /var/log/aws/clusters
+              name: aws-clusters-logs
+              readOnly: true
+          volumes:
+          - name: public-data-ro-volume
+            persistentVolumeClaim:
+              claimName: public-data-ro
+          - name: private-model-rw-volume
+            persistentVolumeClaim:
+              claimName: private-model-rw
+          - name: private-data-ro-volume
+            persistentVolumeClaim:
+              claimName: private-data-rw
+          - name: olympus-pretraining-ro-volume
+            persistentVolumeClaim:
+              claimName: olympus-pretraining-ro
+          - name: agi-cons-ro-volume
+            persistentVolumeClaim:
+              claimName: agi-cons-ro
+          - hostPath:
+              path: /dev/shm
+              type: Directory
+            name: shm
+          - hostPath:
+              path: /var/log/aws/clusters
+              type: DirectoryOrCreate
+            name: aws-clusters-logs

@@ -227,9 +227,26 @@ def gather_log_data(
             group=mpu.get_data_parallel_group_gloo(with_context_parallel=True),
         )
 
-        reduced_log_dict = {
-            f"{metric_name}/{key}": sum([d[key] for d in gathered_log_dict]) / dp_size for key in log_dict
-        }
+        valid_log_dicts = [d for d in gathered_log_dict if isinstance(d, dict)]
+        all_keys = sorted({k for d in valid_log_dicts for k in d.keys()})
+        reduced_log_dict = {}
+        missing_key_ranks: dict[str, int] = {}
+
+        for key in all_keys:
+            key_vals = [d[key] for d in valid_log_dicts if key in d]
+            if not key_vals:
+                continue
+            reduced_log_dict[f"{metric_name}/{key}"] = float(sum(key_vals) / len(key_vals))
+            if len(key_vals) < dp_size:
+                missing_key_ranks[key] = dp_size - len(key_vals)
+
+        if missing_key_ranks:
+            logger.warning(
+                "%s %s: missing metric keys on some DP ranks; averaged over available ranks. missing=%s",
+                metric_name,
+                rollout_id,
+                missing_key_ranks,
+            )
         logger.info(f"{metric_name} {rollout_id}: {reduced_log_dict}")
 
         # Calculate step once to avoid duplication

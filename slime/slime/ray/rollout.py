@@ -46,11 +46,16 @@ class RolloutManager:
 
     def __init__(self, args, pg, prm_pg=None):
         configure_logger()
+        import time as _time
+        _rm_t0 = _time.time()
+        logger.info("[DEBUG] RolloutManager.__init__: starting")
 
         self.args = args
         self.pg = pg
         self.prm_pg = prm_pg
+        logger.info("[DEBUG] RolloutManager.__init__: starting router...")
         _start_router(args, router_ip_attr="sglang_router_ip", router_port_attr="sglang_router_port")
+        logger.info(f"[DEBUG] RolloutManager.__init__: router started ({_time.time() - _rm_t0:.1f}s)")
         if self.args.prm_enable and self.args.prm_num_gpus > 0:
             _start_router(args, router_ip_attr="prm_router_ip", router_port_attr="prm_router_port")
         # TODO make args immutable
@@ -79,7 +84,9 @@ class RolloutManager:
             num_gpu_per_engine = min(args.rollout_num_gpus_per_engine, args.num_gpus_per_node)
             num_engines = args.rollout_num_gpus // num_gpu_per_engine
             self.all_rollout_engines = [None] * num_engines
+        logger.info(f"[DEBUG] RolloutManager.__init__: initializing {len(self.all_rollout_engines)} rollout engines...")
         self.num_new_engines = init_rollout_engines(args, pg, self.all_rollout_engines)
+        logger.info(f"[DEBUG] RolloutManager.__init__: all engines initialized ({_time.time() - _rm_t0:.1f}s total)")
         if self.args.prm_enable and self.args.prm_num_gpus > 0:
             prm_num_gpu_per_engine = min(args.prm_num_gpus_per_engine, args.num_gpus_per_node)
             prm_num_engines = args.prm_num_gpus // prm_num_gpu_per_engine
@@ -855,10 +862,21 @@ def init_rollout_engines(args, pg, all_rollout_engines):
             args=args, num_engines=num_engines, rollout_engines=rollout_engines
         )
 
-    # TODO: don't ray.get here to overlap train actor init with rollout engine init.
-    # somehow if we don't sync here, the --debug-rollout-only mode will crash.
-    init_handles = [engine.init.remote(**(addr_and_ports[rank])) for rank, engine in rollout_engines]
-    ray.get(init_handles)
+    import time as _time
+    _total_t0 = _time.time()
+    logger.info(f"[DEBUG] init_rollout_engines: starting sequential init of {len(rollout_engines)} engines")
+    for idx, (rank, engine) in enumerate(rollout_engines):
+        logger.info(
+            f"[DEBUG] init_rollout_engines: engine {rank}/{len(rollout_engines)} "
+            f"(#{idx+1}) — addr_and_ports={addr_and_ports[rank]}"
+        )
+        _eng_t0 = _time.time()
+        ray.get(engine.init.remote(**(addr_and_ports[rank])))
+        logger.info(
+            f"[DEBUG] init_rollout_engines: engine {rank} READY in {_time.time() - _eng_t0:.1f}s "
+            f"(total elapsed: {_time.time() - _total_t0:.1f}s)"
+        )
+    logger.info(f"[DEBUG] init_rollout_engines: ALL {len(rollout_engines)} engines ready in {_time.time() - _total_t0:.1f}s")
 
     return num_new_engines
 
@@ -921,8 +939,9 @@ def init_prm_engines(args, pg, all_prm_engines):
         num_engines=num_engines,
         prm_engines=prm_engines,
     )
-    init_handles = [engine.init.remote(**(addr_and_ports[rank])) for rank, engine in prm_engines]
-    ray.get(init_handles)
+    for rank, engine in prm_engines:
+        logger.info(f"Initializing PRM engine {rank}/{len(prm_engines)}...")
+        ray.get(engine.init.remote(**(addr_and_ports[rank])))
     return num_new_engines
 
 

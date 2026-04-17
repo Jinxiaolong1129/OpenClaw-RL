@@ -1,0 +1,153 @@
+apiVersion: "kubeflow.org/v1"
+kind: "PyTorchJob"
+metadata:
+  name: myshang-sglang-rollout-server
+  namespace: hyperpod-ns-aladdin
+  labels:
+    kueue.x-k8s.io/queue-name: hyperpod-ns-aladdin-localqueue
+    kueue.x-k8s.io/priority-class: high-p5-priority
+spec:
+  pytorchReplicaSpecs:
+    Worker:
+      replicas: 4
+      restartPolicy: OnFailure
+      template:
+        metadata:
+          labels:
+            kueue.x-k8s.io/queue-name: hyperpod-ns-aladdin-localqueue
+            kueue.x-k8s.io/priority-class: high-p5-priority
+        spec:
+          serviceAccountName: bedrock-sa
+          nodeSelector:
+            beta.kubernetes.io/instance-type: ml.p5.48xlarge
+            sagemaker.amazonaws.com/node-health-status: Schedulable
+            sagemaker.amazonaws.com/deep-health-check-status: Passed
+          containers:
+          - name: pytorch
+            image: 975050351917.dkr.ecr.us-east-2.amazonaws.com/q-codegen:myshang-slime-0.2.2-kos
+            imagePullPolicy: Always
+            securityContext:
+              privileged: true
+            command: ["bash", "-c"]
+            args:
+               - |
+                set -o pipefail
+                set -x
+
+                # Start ray cluster
+                export WORLD_SIZE=${PET_NNODES}
+                echo WORLD_SIZE: $WORLD_SIZE
+                export MASTER_ADDR=$(hostname | sed -E 's/-worker-[0-9]+$/-worker-0/')
+                
+                if [[ "${MASTER_ADDR}" == $(hostname) ]]; then
+                    export IS_MASTER=true
+                    export MASTER_ADDR=$(hostname)
+                    export RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE=1
+                    ray start --head --node-ip-address="${MASTER_ADDR}" --num-gpus=8 --object-store-memory=200000000000 > /ray_head_node_output.txt 2>&1
+                else
+                    export IS_MASTER=false
+                    export MY_ADDR=$(hostname)
+                    export RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE=1
+                    
+                    # Wait for head node to be ready before joining
+                    echo "Waiting for head node at ${MASTER_ADDR}:6379..."
+                    until ray health-check --address="${MASTER_ADDR}:6379" 2>/dev/null; do
+                        echo "Head node not ready yet, retrying in 5 seconds..."
+                        sleep 5
+                    done
+                    echo "Head node is ready, joining cluster..."
+                    
+                    ray start --address="${MASTER_ADDR}:6379" --node-ip-address="${MY_ADDR}" --num-gpus=8 --object-store-memory=200000000000 > /ray_worker_node_output.txt 2>&1 &
+                fi
+
+                if [[ "${IS_MASTER}" == "true" ]]; then
+                  # Wait for all nodes to join
+                  while true; do
+                    count=$(ray status 2>/dev/null | grep -Eo '^ *1 node_[0-9a-f]+' | wc -l)
+                    if [ "$count" -ge "$WORLD_SIZE" ]; then
+                      echo "All $count / $WORLD_SIZE nodes have joined the cluster."
+                      break
+                    fi
+                    echo "Waiting for $WORLD_SIZE nodes to join the cluster... (currently $count)"
+                    sleep 5
+                  done
+
+                  # === Main Script to launch ray job on Master ===
+                  # python your_script.py
+                  
+                fi
+
+                # Keep container alive
+                sleep infinity
+            env:
+            - name: NCCL_TIMEOUT
+              value: "12000"
+            - name: MODEL_PATH
+              value: "/mnt_out/myshang/models/qwen/Qwen3-Coder-30B-A3B-Instruct"
+            - name: TP
+              value: "8"
+            - name: MEM_FRAC
+              value: "0.7"
+            - name: ROUTER_PORT
+              value: "30000"
+            - name: MAX_RUNNING_REQUESTS
+              value: "4"
+            - name: MAX_TOTAL_TOKENS
+              value: "32768"
+            - name: SLIME_DIR
+              value: "/mnt_out/myshang/codebase/slime"
+            - name: LOG_DIR
+              value: "/mnt_out/myshang/logs/slime/sglang_rollout"
+            - name: MLFLOW_TRACKING_URI
+              value: arn:aws:sagemaker:us-east-1:605134433731:mlflow-tracking-server/aladdin-iad
+            - name: TRACKING_SERVER_URI
+              value: arn:aws:sagemaker:us-east-1:605134433731:mlflow-tracking-server/aladdin-iad
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            resources:
+              limits:
+                nvidia.com/gpu: "8"
+                vpc.amazonaws.com/efa: "32"
+              requests:
+                nvidia.com/gpu: "8"
+                vpc.amazonaws.com/efa: "32"
+            volumeMounts:
+            - mountPath: /mnt
+              name: public-data-ro-volume
+            - mountPath: /mnt_out
+              name: private-model-rw-volume
+            - mountPath: /mnt_private
+              name: private-data-ro-volume
+            - mountPath: /mnt_agi_data
+              name: olympus-pretraining-ro-volume
+            - mountPath: /mnt_agi_cons
+              name: agi-cons-ro-volume
+            - mountPath: /dev/shm
+              name: shm
+            - mountPath: /var/log/aws/clusters
+              name: aws-clusters-logs
+              readOnly: true
+          volumes:
+          - name: public-data-ro-volume
+            persistentVolumeClaim:
+              claimName: public-data-ro
+          - name: private-model-rw-volume
+            persistentVolumeClaim:
+              claimName: private-model-rw
+          - name: private-data-ro-volume
+            persistentVolumeClaim:
+              claimName: private-data-rw
+          - name: olympus-pretraining-ro-volume
+            persistentVolumeClaim:
+              claimName: olympus-pretraining-ro
+          - name: agi-cons-ro-volume
+            persistentVolumeClaim:
+              claimName: agi-cons-ro
+          - hostPath:
+              path: /dev/shm
+              type: Directory
+            name: shm
+          - hostPath:
+              path: /var/log/aws/clusters
+              type: DirectoryOrCreate
+            name: aws-clusters-logs

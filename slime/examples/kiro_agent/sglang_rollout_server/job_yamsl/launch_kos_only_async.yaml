@@ -1,0 +1,155 @@
+apiVersion: "kubeflow.org/v1"
+kind: "PyTorchJob"
+metadata:
+  name: myshang-slime-kos-server-0311-2
+  namespace: hyperpod-ns-aladdin
+  labels:
+    kueue.x-k8s.io/queue-name: hyperpod-ns-aladdin-localqueue
+    kueue.x-k8s.io/priority-class: high-p5-priority
+spec:
+  pytorchReplicaSpecs:
+    Worker:
+      replicas: 80  # CPU nodes for KoS agent servers
+      restartPolicy: OnFailure
+      template:
+        metadata:
+          labels:
+            kueue.x-k8s.io/queue-name: hyperpod-ns-aladdin-localqueue
+            kueue.x-k8s.io/priority-class: high-p5-priority
+        spec:
+          serviceAccountName: bedrock-sa
+          nodeSelector:
+            beta.kubernetes.io/instance-type: ml.m5.24xlarge
+            sagemaker.amazonaws.com/node-health-status: Schedulable
+          containers:
+          - name: pytorch
+            image: 975050351917.dkr.ecr.us-east-2.amazonaws.com/q-codegen:myshang-kos-server-0227
+            imagePullPolicy: Always
+            securityContext:
+              privileged: true  # Needed for Docker-in-Docker (SWE tasks)
+            command: ["bash", "-c"]
+            args:
+              - |
+                set -o pipefail
+                set -x
+
+                LOG_DIR="/mnt_out/myshang/logs/slime/kos/${RUN_NAME}"
+                mkdir -p "${LOG_DIR}/logs"
+                HOSTNAME=$(hostname)
+                LOG_FILE="${LOG_DIR}/logs/${HOSTNAME}_kos_$(date +%Y%m%d_%H%M%S).log"
+                echo "Logging to: ${LOG_FILE}"
+
+                # Clean up /dev/shm before Docker startup
+                echo "Cleaning up /dev/shm before Docker startup..."
+                echo "Before cleanup: $(du -sh /dev/shm/ 2>/dev/null | cut -f1)"
+                rm -rf /dev/shm/containerd
+                rm -rf /dev/shm/containers
+                rm -rf /dev/shm/docker_data
+                rm -rf /dev/shm/buildkit
+                rm -rf /dev/shm/rootfs
+                rm -rf /dev/shm/volumes
+                rm -rf /dev/shm/plugins
+                rm -rf /dev/shm/network
+                rm -rf /dev/shm/swarm
+                rm -rf /dev/shm/tmp
+                rm -rf /dev/shm/runtimes
+                rm -f /dev/shm/engine-id
+                rm -f /dev/shm/nccl-*
+                echo "After cleanup: $(du -sh /dev/shm/ 2>/dev/null | cut -f1)"
+
+                bash ${SLIME_DIR}/examples/kiro_agent/sglang_rollout_server/launch_kos_only.sh \
+                  --sglang-env-file "${SGLANG_ENV_BASE}/${SGLANG_RUN_NAME}/sglang_external_rollout.env" \
+                  --model-path "${MODEL_PATH}" \
+                  --kos-home "${KOS_HOME}" \
+                  --kos-workspace-path "${KOS_WORKSPACE_PATH}" \
+                  --kos-swe-docker-images "${KOS_SWE_DOCKER_IMAGES}" \
+                  --kos-num-workers "${KOS_NUM_WORKERS}" \
+                  --kos-max-concurrent-agents "${KOS_MAX_CONCURRENT_AGENTS}" \
+                  --kos-max-iterations "${KOS_MAX_ITERATIONS}" \
+                  --kos-timeout "${KOS_TIMEOUT}" \
+                  --run-name "${RUN_NAME}" \
+                  --output-dir /mnt_out/myshang/logs/slime \
+                  2>&1 | tee "${LOG_FILE}"
+
+                echo "Script exited with code $?. Sleeping to keep pod alive for debugging."
+                sleep infinity
+            env:
+            # --- SGLang connection (points to GPU job's env file) ---
+            - name: SGLANG_ENV_BASE
+              value: "/mnt_out/myshang/logs/slime"
+            - name: SGLANG_RUN_NAME
+              value: "sglang_server_0311"
+            # --- Model (for DEFAULT_MODEL_PATH env in KoS) ---
+            - name: MODEL_PATH
+              value: "/mnt_out/myshang/models/qwen/Qwen3-Coder-30B-A3B-Instruct"
+            # --- KoS ---
+            - name: KOS_HOME
+              value: "/mnt_out/myshang/codebase/Kiro-on-Strands"
+            - name: KOS_WORKSPACE_PATH
+              value: "/mnt_private/zhenghuj/crux_0314_java_srctest_300_lines/crux_0318_java_9k_workspace/"
+            - name: KOS_SWE_DOCKER_IMAGES
+              value: "/mnt_out/zhenghuj/docker_images/sweap_images_800/"
+            - name: KOS_NUM_WORKERS
+              value: "16"
+            - name: KOS_MAX_CONCURRENT_AGENTS
+              value: "16"
+            - name: KOS_MAX_ITERATIONS
+              value: "60"
+            - name: KOS_TIMEOUT
+              value: "3600"
+            - name: SKIP_TEST_EXECUTION
+              value: "0"
+            - name: MAX_CACHED_IMAGES
+              value: "25"
+            # --- General ---
+            - name: RUN_NAME
+              value: "kos_server_0311_1"
+            - name: SLIME_DIR
+              value: "/mnt_out/myshang/codebase/slime"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            # resources:
+            #   requests:
+            #     memory: "200Gi"
+            #   limits:
+            #     memory: "300Gi"
+            volumeMounts:
+            - mountPath: /mnt
+              name: public-data-ro-volume
+            - mountPath: /mnt_out
+              name: private-model-rw-volume
+            - mountPath: /mnt_private
+              name: private-data-ro-volume
+            - mountPath: /mnt_agi_data
+              name: olympus-pretraining-ro-volume
+            - mountPath: /mnt_agi_cons
+              name: agi-cons-ro-volume
+            - mountPath: /dev/shm
+              name: shm
+            - mountPath: /var/log/aws/clusters
+              name: aws-clusters-logs
+              readOnly: true
+          volumes:
+          - name: public-data-ro-volume
+            persistentVolumeClaim:
+              claimName: public-data-ro
+          - name: private-model-rw-volume
+            persistentVolumeClaim:
+              claimName: private-model-rw
+          - name: private-data-ro-volume
+            persistentVolumeClaim:
+              claimName: private-data-rw
+          - name: olympus-pretraining-ro-volume
+            persistentVolumeClaim:
+              claimName: olympus-pretraining-ro
+          - name: agi-cons-ro-volume
+            persistentVolumeClaim:
+              claimName: agi-cons-ro
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 180Gi
+          - hostPath:
+              path: /var/log/aws/clusters
+              type: DirectoryOrCreate
+            name: aws-clusters-logs

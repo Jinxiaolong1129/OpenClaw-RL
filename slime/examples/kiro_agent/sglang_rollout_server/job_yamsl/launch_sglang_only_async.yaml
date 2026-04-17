@@ -1,0 +1,142 @@
+apiVersion: "kubeflow.org/v1"
+kind: "PyTorchJob"
+metadata:
+  name: myshang-slime-sglang-server-0311
+  namespace: hyperpod-ns-aladdin
+  labels:
+    kueue.x-k8s.io/queue-name: hyperpod-ns-aladdin-localqueue
+    kueue.x-k8s.io/priority-class: high-p5-priority
+spec:
+  pytorchReplicaSpecs:
+    Worker:
+      replicas: 8  # GPU nodes for SGLang engines only
+      restartPolicy: OnFailure
+      template:
+        metadata:
+          labels:
+            kueue.x-k8s.io/queue-name: hyperpod-ns-aladdin-localqueue
+            kueue.x-k8s.io/priority-class: high-p5-priority
+        spec:
+          serviceAccountName: bedrock-sa
+          nodeSelector:
+            beta.kubernetes.io/instance-type: ml.p5.48xlarge
+            sagemaker.amazonaws.com/node-health-status: Schedulable
+            sagemaker.amazonaws.com/deep-health-check-status: Passed
+          containers:
+          - name: pytorch
+            # image: 975050351917.dkr.ecr.us-east-2.amazonaws.com/q-codegen:myshang-slime-0.2.2-kos-mlflow
+            image: 975050351917.dkr.ecr.us-east-2.amazonaws.com/q-codegen:myshang-slime-0.2.2-sglang-0.5.9-patch
+            imagePullPolicy: Always
+            securityContext:
+              privileged: true
+            command: ["bash", "-c"]
+            args:
+              - |
+                set -o pipefail
+                set -x
+
+                LOG_DIR="/mnt_out/myshang/logs/slime/sglang/${RUN_NAME}"
+                mkdir -p "${LOG_DIR}/logs"
+                HOSTNAME=$(hostname)
+                LOG_FILE="${LOG_DIR}/logs/${HOSTNAME}_sglang_$(date +%Y%m%d_%H%M%S).log"
+                echo "Logging to: ${LOG_FILE}"
+
+                echo "Cleaning up /dev/shm before Docker startup..."
+                echo "Before cleanup: $(du -sh /dev/shm/ 2>/dev/null | cut -f1)"
+
+                rm -rf /dev/shm/containerd
+                rm -rf /dev/shm/containers
+                rm -rf /dev/shm/docker_data
+                rm -rf /dev/shm/buildkit
+                rm -rf /dev/shm/rootfs
+                rm -rf /dev/shm/volumes
+                rm -rf /dev/shm/plugins
+                rm -rf /dev/shm/network
+                rm -rf /dev/shm/swarm
+                rm -rf /dev/shm/tmp
+                rm -rf /dev/shm/runtimes
+                rm -f /dev/shm/engine-id
+                rm -f /dev/shm/nccl-*
+                echo "After cleanup: $(du -sh /dev/shm/ 2>/dev/null | cut -f1)"
+
+                bash ${SLIME_DIR}/examples/kiro_agent/sglang_rollout_server/launch_sglang_only.sh \
+                  --model-path "${MODEL_PATH}" \
+                  --tp-size "${TP_SIZE}" \
+                  --mem-fraction "${MEM_FRACTION}" \
+                  --chunked-prefill-size "${CHUNKED_PREFILL_SIZE}" \
+                  --router-port "${ROUTER_PORT}" \
+                  --run-name "${RUN_NAME}" \
+                  --output-dir /mnt_out/myshang/logs/slime \
+                  --slime-dir "${SLIME_DIR}" \
+                  2>&1 | tee "${LOG_FILE}"
+
+                echo "Script exited with code $?. Sleeping to keep pod alive for debugging."
+                sleep infinity
+            env:
+            # --- SGLang ---
+            - name: MODEL_PATH
+              value: "/mnt_out/myshang/models/qwen/Qwen3-Coder-30B-A3B-Instruct"
+            - name: TP_SIZE
+              value: "8"
+            - name: MEM_FRACTION
+              value: "0.8"
+            - name: CHUNKED_PREFILL_SIZE
+              value: "8192"
+            - name: ROUTER_PORT
+              value: "30000"
+            # --- General ---
+            - name: RUN_NAME
+              value: "sglang_server_0311"
+            - name: SLIME_DIR
+              value: "/mnt_out/myshang/codebase/slime"
+            - name: NCCL_TIMEOUT
+              value: "12000"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            resources:
+              limits:
+                nvidia.com/gpu: "8"
+                vpc.amazonaws.com/efa: "32"
+              requests:
+                nvidia.com/gpu: "8"
+                vpc.amazonaws.com/efa: "32"
+            volumeMounts:
+            - mountPath: /mnt
+              name: public-data-ro-volume
+            - mountPath: /mnt_out
+              name: private-model-rw-volume
+            - mountPath: /mnt_private
+              name: private-data-ro-volume
+            - mountPath: /mnt_agi_data
+              name: olympus-pretraining-ro-volume
+            - mountPath: /mnt_agi_cons
+              name: agi-cons-ro-volume
+            - mountPath: /dev/shm
+              name: shm
+            - mountPath: /var/log/aws/clusters
+              name: aws-clusters-logs
+              readOnly: true
+          volumes:
+          - name: public-data-ro-volume
+            persistentVolumeClaim:
+              claimName: public-data-ro
+          - name: private-model-rw-volume
+            persistentVolumeClaim:
+              claimName: private-model-rw
+          - name: private-data-ro-volume
+            persistentVolumeClaim:
+              claimName: private-data-rw
+          - name: olympus-pretraining-ro-volume
+            persistentVolumeClaim:
+              claimName: olympus-pretraining-ro
+          - name: agi-cons-ro-volume
+            persistentVolumeClaim:
+              claimName: agi-cons-ro
+          - hostPath:
+              path: /dev/shm
+              type: Directory
+            name: shm
+          - hostPath:
+              path: /var/log/aws/clusters
+              type: DirectoryOrCreate
+            name: aws-clusters-logs

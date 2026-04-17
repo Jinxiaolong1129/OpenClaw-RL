@@ -1,0 +1,100 @@
+apiVersion: "kubeflow.org/v1"
+kind: "PyTorchJob"
+metadata:
+  name: myshang-sglang-rollout-server
+  namespace: hyperpod-ns-aladdin
+  labels:
+    kueue.x-k8s.io/queue-name: hyperpod-ns-aladdin-localqueue
+spec:
+  pytorchReplicaSpecs:
+    Worker:
+      replicas: 4 # Number of nodes for teacher server
+      restartPolicy: OnFailure
+      template:
+        metadata:
+          labels:
+              kueue.x-k8s.io/queue-name: hyperpod-ns-aladdin-localqueue
+        spec:
+          serviceAccountName: bedrock-sa
+          nodeSelector:
+            beta.kubernetes.io/instance-type: ml.p4d.24xlarge # or ml.p5e.48xlarge for larger models
+            sagemaker.amazonaws.com/node-health-status: Schedulable
+            sagemaker.amazonaws.com/deep-health-check-status: Passed
+          containers: 
+          - name: pytorch
+            image: 975050351917.dkr.ecr.us-east-2.amazonaws.com/q-codegen:myshang-slime-v0.5.7
+            imagePullPolicy: Always
+            securityContext:
+              privileged: true
+            command: ["bash", "-c"]
+            args:
+              - |
+                # Create log directory and set up logging
+                LOG_DIR="${LOG_DIR:-/mnt_out/myshang/logs/slime/sglang_rollout}"
+                mkdir -p "$LOG_DIR"
+                HOSTNAME=$(hostname)
+                LOG_FILE="${LOG_DIR}/${HOSTNAME}_$(date +%Y%m%d_%H%M%S).log"
+                
+                echo "Logging to: $LOG_FILE"
+                
+                # Run script with output to both console and log file
+                bash /mnt_out/myshang/codebase/slime/examples/kiro_agent/sglang_rollout_server/launch_external_sglang.sh \
+                  --model-path $MODEL_PATH \
+                  --tp-size $TP \
+                  2>&1 | tee "$LOG_FILE"
+            env:
+            - name: NCCL_TIMEOUT
+              value: "12000"
+            - name: MODEL_PATH
+              value: "/mnt_out/myshang/models/qwen/Qwen3-Coder-30B-A3B-Instruct"
+            - name: TP
+              value: "8"
+            - name: MEM_FRAC
+              value: "0.7"
+            - name: ROUTER_PORT
+              value: "30000"
+            - name: MAX_RUNNING_REQUESTS
+              value: "4"
+            - name: MAX_TOTAL_TOKENS
+              value: "32768"
+            - name: SLIME_DIR
+              value: "/mnt_out/myshang/codebase/slime"
+            - name: LOG_DIR
+              value: "/mnt_out/myshang/logs/slime/teacher_server"
+            resources:
+              limits:
+                nvidia.com/gpu: "8"
+                vpc.amazonaws.com/efa: "4"
+              requests:
+                nvidia.com/gpu: "8"
+                vpc.amazonaws.com/efa: "4"
+            volumeMounts:
+            - mountPath: /mnt
+              name: public-data-ro-volume
+            - mountPath: /mnt_out
+              name: private-model-rw-volume
+            - mountPath: /mnt_private
+              name: private-data-rw-volume
+            - mountPath: /dev/shm
+              name: shm
+            - mountPath: /var/log/aws/clusters
+              name: aws-clusters-logs
+              readOnly: true
+          volumes:
+          - name: public-data-ro-volume
+            persistentVolumeClaim:
+              claimName: public-data-ro
+          - name: private-model-rw-volume
+            persistentVolumeClaim:
+              claimName: private-model-rw
+          - name: private-data-rw-volume
+            persistentVolumeClaim:
+              claimName: private-data-rw
+          - hostPath:
+              path: /dev/shm
+              type: Directory
+            name: shm
+          - hostPath:
+              path: /var/log/aws/clusters
+              type: DirectoryOrCreate
+            name: aws-clusters-logs

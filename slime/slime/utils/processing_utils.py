@@ -27,6 +27,21 @@ def load_processor(name_or_path: str, **kwargs):
     if isinstance(proc, PreTrainedTokenizerBase) or not isinstance(proc, ProcessorMixin):
         proc = None
 
+    # AutoProcessor may return a VL processor for text-only models (e.g.
+    # Qwen3.5-27B gets Qwen3VLProcessor in transformers>=5.x).  Detect this
+    # by checking whether the model actually has a vision component.
+    if proc is not None:
+        try:
+            from transformers import AutoConfig
+            config = AutoConfig.from_pretrained(name_or_path, trust_remote_code=kwargs.get("trust_remote_code", False))
+            model_type = getattr(config, "model_type", "")
+            # Only keep processor for genuine vision/multimodal models
+            if model_type and "vl" not in model_type.lower() and "vision" not in model_type.lower():
+                logger.info(f"Discarding processor ({type(proc).__name__}) for text-only model_type={model_type}")
+                proc = None
+        except Exception:
+            pass
+
     return proc
 
 

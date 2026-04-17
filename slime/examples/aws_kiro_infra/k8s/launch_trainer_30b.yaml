@@ -1,0 +1,178 @@
+# =============================================================================
+# Trainer pool — 30B Qwen3-Coder-A3B (rllm/DeepSWE GRPO++ recipe, SYNC)
+# =============================================================================
+# 对齐 rllm/DeepSWE 配方（`rllm/examples/swe/train_deepswe_32b.sh`）:
+#   - R2E-Gym 数据集(data_source=r2e-gym, server 自动走 r2e eval 策略)
+#   - Sync (train.py, 不用 async pipeline)
+#   - GRPO++ : 非对称 clip 0.2/0.28, 无 KL, 无 entropy, Dr.GRPO length norm
+#   - Compact filter (在 generate_kiro_rllm 里)
+#   - DAPO oversample + reward-nonzero-std filter
+# =============================================================================
+apiVersion: "kubeflow.org/v1"
+kind: "PyTorchJob"
+metadata:
+  name: swerl-30b-trainer
+  namespace: hyperpod-ns-aladdin
+  labels:
+    kueue.x-k8s.io/queue-name: hyperpod-ns-aladdin-localqueue
+    kueue.x-k8s.io/priority-class: high-p5-priority
+spec:
+  pytorchReplicaSpecs:
+    Worker:
+      replicas: 16                              # Kiro production default
+      restartPolicy: OnFailure
+      template:
+        metadata:
+          labels:
+            kueue.x-k8s.io/queue-name: hyperpod-ns-aladdin-localqueue
+            kueue.x-k8s.io/priority-class: high-p5-priority
+        spec:
+          serviceAccountName: bedrock-sa
+          nodeSelector:
+            beta.kubernetes.io/instance-type: ml.p5.48xlarge
+            sagemaker.amazonaws.com/node-health-status: Schedulable
+            sagemaker.amazonaws.com/deep-health-check-status: Passed
+          containers:
+          - name: pytorch
+            image: 975050351917.dkr.ecr.us-east-2.amazonaws.com/q-codegen:swerl-aws-kiro-0.1.0
+            imagePullPolicy: Always
+            command: ["bash", "-c"]
+            args:
+              - |
+                set -ex
+                set -o pipefail
+
+                SGLANG_ENV_FILE="${SGLANG_ENV_BASE}/${SGLANG_RUN_NAME}/sglang_external_rollout.env"
+                AGENT_ENV_FILE="${SGLANG_ENV_BASE}/${SWE_AGENT_RUN_NAME}/swe_agents.env"
+
+                for F in "${SGLANG_ENV_FILE}" "${AGENT_ENV_FILE}"; do
+                  echo "Waiting for $F ..."
+                  WAITED=0
+                  while [ ! -f "${F}" ]; do
+                    if [ "${WAITED}" -ge 1800 ]; then
+                      echo "ERROR: timeout waiting for ${F}"; exit 1
+                    fi
+                    sleep 10; WAITED=$((WAITED + 10))
+                    [ $((WAITED % 60)) -eq 0 ] && echo "  still waiting (${WAITED}s)..."
+                  done
+                  echo "Found ${F}:"; cat "${F}"
+                done
+
+                source "${AGENT_ENV_FILE}"
+                export SWE_AGENT_URLS
+                echo "SWE_AGENT_URLS=${SWE_AGENT_URLS}"
+
+                rm -rf /dev/shm/containerd /dev/shm/containers /dev/shm/docker_data
+                rm -rf /dev/shm/buildkit /dev/shm/rootfs /dev/shm/volumes
+                rm -rf /dev/shm/plugins /dev/shm/network /dev/shm/swarm
+                rm -rf /dev/shm/tmp /dev/shm/runtimes
+                rm -f /dev/shm/engine-id /dev/shm/nccl-*
+
+                LOG_DIR="/mnt_out/${USER:-default}/logs/swerl-aws-kiro/trainer/${RUN_NAME}"
+                mkdir -p "${LOG_DIR}"
+                LOG_FILE="${LOG_DIR}/$(hostname)_$(date +%Y%m%d_%H%M%S).log"
+                bash ${AWS_KIRO_DIR}/scripts/run_swe_rl_30b_rllm_trainer.sh 2>&1 | tee "${LOG_FILE}"
+            env:
+            - name: RUN_NAME
+              value: "swerl_30b_rllm"
+            - name: SGLANG_RUN_NAME
+              value: "swerl_30b_sglang"
+            - name: SWE_AGENT_RUN_NAME
+              value: "swerl_swe_agents"
+            - name: SGLANG_ENV_BASE
+              value: "/mnt_out/jinxiaolong/logs/swerl-aws-kiro"
+            # --- Paths ---
+            - name: SLIME_DIR
+              value: "/mnt_out/jinxiaolong/codebase/slime"
+            - name: AWS_KIRO_DIR
+              value: "/mnt_out/jinxiaolong/codebase/slime/examples/aws_kiro_infra"
+            - name: MEGATRON_LM_PATH
+              value: "/mnt_out/jinxiaolong/codebase/Megatron-LM"
+            - name: EXPORT_ROOT
+              value: "/mnt_out/jinxiaolong/ckpt/swerl-aws-kiro"
+            # --- Model / data ---
+            - name: HF_CKPT
+              value: "/mnt_out/jinxiaolong/models/Qwen3-Coder-30B-A3B-Instruct"
+            - name: REF_LOAD
+              value: "/mnt_out/jinxiaolong/models/Qwen3-Coder-30B-A3B-Instruct-mcore"
+            # ★ R2E-Gym-Subset: DeepSWE 官方训练集 (4578 filtered instances)
+            # data_source="r2e-gym" → server 走 r2e eval 策略
+            - name: PROMPT_DATA
+              value: "/mnt_out/jinxiaolong/data/r2egym_subset_train.parquet"
+            # rllm GRPO++ 关键参数
+            - name: ROLLOUT_BATCH_SIZE
+              value: "8"                         # DeepSWE 官方 data.train_batch_size=8
+            - name: N_SAMPLES_PER_PROMPT
+              value: "8"                         # DeepSWE 官方 rollout.n=8
+            - name: OVER_SAMPLING_BATCH_SIZE
+              value: "16"                        # DAPO oversample
+            - name: ROLLOUT_MAX_RESPONSE_LEN
+              value: "32768"                     # DeepSWE 官方
+            - name: SWE_RL_MAX_RESPONSE_LENGTH
+              value: "32768"                     # Dr.GRPO length norm 常量
+            # --- 30B parallelism (Kiro production values) ---
+            - name: TENSOR_MODEL_PARALLEL_SIZE
+              value: "4"
+            - name: PIPELINE_MODEL_PARALLEL_SIZE
+              value: "2"
+            - name: CONTEXT_PARALLEL_SIZE
+              value: "8"
+            - name: EXPERT_MODEL_PARALLEL_SIZE
+              value: "8"
+            - name: EXPERT_TENSOR_PARALLEL_SIZE
+              value: "1"
+            - name: RECOMPUTE_GRANULARITY
+              value: "full"
+            - name: RECOMPUTE_METHOD
+              value: "uniform"
+            - name: RECOMPUTE_NUM_LAYERS
+              value: "1"
+            - name: USE_DYNAMIC_BATCH_SIZE
+              value: "true"
+            - name: MAX_TOKENS_PER_GPU
+              value: "32768"
+            - name: LOG_PROBS_MAX_TOKENS_PER_GPU
+              value: "65536"
+            - name: LOG_PROBS_CHUNK_SIZE
+              value: "512"
+            # SYNC 模式: 不用 UPDATE_WEIGHTS_INTERVAL (async-only 参数)
+            # --- SWE rollout tuning (scaled up for 80-pod KoS throughput) ---
+            - name: SWE_MAX_CONCURRENT
+              value: "1024"
+            - name: SWE_ROLLOUT_TIMEOUT
+              value: "3600"
+            - name: SWE_EVAL_TIMEOUT
+              value: "600"
+            - name: PET_NNODES
+              value: "16"
+            - name: NCCL_TIMEOUT
+              value: "12000"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PYTORCH_ALLOC_CONF
+              value: "expandable_segments:True"
+            resources:
+              limits:
+                nvidia.com/gpu: "8"
+                vpc.amazonaws.com/efa: "32"
+              requests:
+                nvidia.com/gpu: "8"
+                vpc.amazonaws.com/efa: "32"
+            volumeMounts:
+            - mountPath: /mnt_out
+              name: private-model-rw-volume
+            - mountPath: /mnt_private
+              name: private-data-ro-volume
+            - mountPath: /dev/shm
+              name: shm
+          volumes:
+          - name: private-model-rw-volume
+            persistentVolumeClaim:
+              claimName: private-model-rw
+          - name: private-data-ro-volume
+            persistentVolumeClaim:
+              claimName: private-data-rw
+          - hostPath:
+              path: /dev/shm
+              type: Directory
+            name: shm

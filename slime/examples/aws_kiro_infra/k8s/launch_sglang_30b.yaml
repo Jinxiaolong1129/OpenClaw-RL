@@ -1,0 +1,115 @@
+# =============================================================================
+# SGLang pool (GPU) — 30B Qwen3-Coder-A3B (matches Kiro production exactly)
+# =============================================================================
+# Replicas / MEM_FRACTION / chunked-prefill match Kiro's launch_sglang_only_async.yaml.
+# =============================================================================
+apiVersion: "kubeflow.org/v1"
+kind: "PyTorchJob"
+metadata:
+  name: swerl-30b-sglang
+  namespace: hyperpod-ns-aladdin
+  labels:
+    kueue.x-k8s.io/queue-name: hyperpod-ns-aladdin-localqueue
+    kueue.x-k8s.io/priority-class: high-p5-priority
+spec:
+  pytorchReplicaSpecs:
+    Worker:
+      replicas: 8                               # 8 × 8 GPU = 64 GPU (Kiro default)
+      restartPolicy: OnFailure
+      template:
+        metadata:
+          labels:
+            kueue.x-k8s.io/queue-name: hyperpod-ns-aladdin-localqueue
+            kueue.x-k8s.io/priority-class: high-p5-priority
+        spec:
+          serviceAccountName: bedrock-sa
+          nodeSelector:
+            beta.kubernetes.io/instance-type: ml.p5.48xlarge
+            sagemaker.amazonaws.com/node-health-status: Schedulable
+            sagemaker.amazonaws.com/deep-health-check-status: Passed
+          containers:
+          - name: pytorch
+            image: 975050351917.dkr.ecr.us-east-2.amazonaws.com/q-codegen:swerl-aws-kiro-0.1.0
+            imagePullPolicy: Always
+            securityContext:
+              privileged: true
+            command: ["bash", "-c"]
+            args:
+              - |
+                set -o pipefail
+                set -x
+
+                LOG_DIR="/mnt_out/${USER:-default}/logs/swerl-aws-kiro/sglang/${RUN_NAME}"
+                mkdir -p "${LOG_DIR}/logs"
+                LOG_FILE="${LOG_DIR}/logs/$(hostname)_$(date +%Y%m%d_%H%M%S).log"
+
+                rm -rf /dev/shm/containerd /dev/shm/containers /dev/shm/docker_data
+                rm -rf /dev/shm/buildkit /dev/shm/rootfs /dev/shm/volumes
+                rm -rf /dev/shm/plugins /dev/shm/network /dev/shm/swarm
+                rm -rf /dev/shm/tmp /dev/shm/runtimes
+                rm -f /dev/shm/engine-id /dev/shm/nccl-*
+
+                bash ${AWS_KIRO_DIR}/scripts/launch_sglang.sh \
+                  --model-path          "${MODEL_PATH}" \
+                  --tp-size             "${TP_SIZE}" \
+                  --mem-fraction        "${MEM_FRACTION}" \
+                  --chunked-prefill-size "${CHUNKED_PREFILL_SIZE}" \
+                  --router-port         "${ROUTER_PORT}" \
+                  --run-name            "${RUN_NAME}" \
+                  --output-dir          "${OUTPUT_DIR}" \
+                  --slime-dir           "${SLIME_DIR}" \
+                  2>&1 | tee "${LOG_FILE}"
+
+                EXIT=$?
+                echo "SGLang launcher exited ${EXIT}; sleeping for inspection"
+                sleep infinity
+            env:
+            - name: MODEL_PATH
+              value: "/mnt_out/jinxiaolong/models/Qwen3-Coder-30B-A3B-Instruct"
+            - name: TP_SIZE
+              value: "8"
+            - name: MEM_FRACTION
+              value: "0.80"                     # Kiro uses 0.8 for 30B
+            - name: CHUNKED_PREFILL_SIZE
+              value: "8192"                     # Kiro setting for 30B
+            - name: ROUTER_PORT
+              value: "30000"
+            - name: RUN_NAME
+              value: "swerl_30b_sglang"
+            - name: OUTPUT_DIR
+              value: "/mnt_out/jinxiaolong/logs/swerl-aws-kiro"
+            - name: SLIME_DIR
+              value: "/mnt_out/jinxiaolong/codebase/slime"
+            - name: AWS_KIRO_DIR
+              value: "/mnt_out/jinxiaolong/codebase/slime/examples/aws_kiro_infra"
+            - name: NCCL_TIMEOUT
+              value: "12000"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PET_NNODES
+              value: "8"
+            resources:
+              limits:
+                nvidia.com/gpu: "8"
+                vpc.amazonaws.com/efa: "32"
+              requests:
+                nvidia.com/gpu: "8"
+                vpc.amazonaws.com/efa: "32"
+            volumeMounts:
+            - mountPath: /mnt_out
+              name: private-model-rw-volume
+            - mountPath: /mnt_private
+              name: private-data-ro-volume
+            - mountPath: /dev/shm
+              name: shm
+          volumes:
+          - name: private-model-rw-volume
+            persistentVolumeClaim:
+              claimName: private-model-rw
+          - name: private-data-ro-volume
+            persistentVolumeClaim:
+              claimName: private-data-rw
+          - hostPath:
+              path: /dev/shm
+              type: Directory
+            name: shm

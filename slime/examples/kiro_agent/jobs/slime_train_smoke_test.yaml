@@ -1,0 +1,127 @@
+apiVersion: "kubeflow.org/v1"
+kind: "PyTorchJob"
+metadata:
+  name: myshang-slime-smoke-test-mlflow
+  namespace: hyperpod-ns-aladdin
+  labels:
+    kueue.x-k8s.io/queue-name: hyperpod-ns-aladdin-localqueue
+    kueue.x-k8s.io/priority-class: high-p5-priority
+spec:
+  pytorchReplicaSpecs:
+    Worker:
+      replicas: 8
+      restartPolicy: OnFailure
+      template:
+        metadata:
+          labels:
+            kueue.x-k8s.io/queue-name: hyperpod-ns-aladdin-localqueue
+            kueue.x-k8s.io/priority-class: high-p5-priority
+        spec:
+          serviceAccountName: bedrock-sa
+          nodeSelector:
+            beta.kubernetes.io/instance-type: ml.p5.48xlarge
+            sagemaker.amazonaws.com/node-health-status: Schedulable
+            sagemaker.amazonaws.com/deep-health-check-status: Passed
+          containers:
+          - name: pytorch
+            image: 975050351917.dkr.ecr.us-east-2.amazonaws.com/q-codegen:myshang-slime-0.2.2-kos-mlflow
+            imagePullPolicy: Always
+            securityContext:
+              privileged: true
+            command: ["bash", "-c"]
+            args:
+              - |
+                set -ex
+                export SGLANG_ENV_FILE=${SGLANG_ENV_BASE}/${RUN_NAME}/sglang_external_rollout.env
+                # Verify SGLang env file exists (launched by a separate job)
+                if [ ! -f "$SGLANG_ENV_FILE" ]; then
+                  echo "ERROR: SGLANG_ENV_FILE not found at $SGLANG_ENV_FILE"
+                  echo "Make sure the SGLang server job is running and has written this file."
+                  exit 1
+                fi
+                echo "Found SGLang env file:"
+                cat "$SGLANG_ENV_FILE"
+
+                # run-qwen3-30b-kiro-kos.sh handles Ray cluster setup
+                # (head/worker branching, waiting for all nodes) and training.
+                bash ${SLIME_DIR}/examples/kiro_agent/run-qwen3-30b-kiro-kos.sh
+            env:
+            - name: NCCL_TIMEOUT
+              value: "12000"
+            - name: MODEL_PATH
+              value: "/mnt_out/myshang/models/qwen/Qwen3-Coder-30B-A3B-Instruct"
+            - name: TP
+              value: "8"
+            - name: ROUTER_PORT
+              value: "30000"
+            - name: MAX_TOTAL_TOKENS
+              value: "32768"
+            - name: SLIME_DIR
+              value: "/mnt_out/myshang/codebase/slime"
+            - name: LOG_DIR
+              value: "/mnt_out/myshang/logs/slime"
+            - name: RUN_NAME
+              value: "smoke_test"
+            - name: SGLANG_ENV_BASE
+              value: "/mnt_out/myshang/logs/slime"
+            - name: KOS_TIMEOUT
+              value: "3600"
+            - name: TRAJECTORY_FOLDER
+              value: "/mnt_out/myshang/logs/slime/trajectory_folder"
+            - name: MLFLOW_TRACKING_URI
+              value: arn:aws:sagemaker:us-east-1:605134433731:mlflow-tracking-server/aladdin-iad
+            - name: TRACKING_SERVER_URI
+              value: arn:aws:sagemaker:us-east-1:605134433731:mlflow-tracking-server/aladdin-iad
+            - name: MLFLOW_EXPERIMENT_NAME
+              value: "slime-kos-smoke-test"
+            - name: MLFLOW_RUN_NAME
+              value: "qwen3-30b-kos-smoke-test"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            resources:
+              limits:
+                nvidia.com/gpu: "8"
+                vpc.amazonaws.com/efa: "32"
+              requests:
+                nvidia.com/gpu: "8"
+                vpc.amazonaws.com/efa: "32"
+            volumeMounts:
+            - mountPath: /mnt
+              name: public-data-ro-volume
+            - mountPath: /mnt_out
+              name: private-model-rw-volume
+            - mountPath: /mnt_private
+              name: private-data-ro-volume
+            - mountPath: /mnt_agi_data
+              name: olympus-pretraining-ro-volume
+            - mountPath: /mnt_agi_cons
+              name: agi-cons-ro-volume
+            - mountPath: /dev/shm
+              name: shm
+            - mountPath: /var/log/aws/clusters
+              name: aws-clusters-logs
+              readOnly: true
+          volumes:
+          - name: public-data-ro-volume
+            persistentVolumeClaim:
+              claimName: public-data-ro
+          - name: private-model-rw-volume
+            persistentVolumeClaim:
+              claimName: private-model-rw
+          - name: private-data-ro-volume
+            persistentVolumeClaim:
+              claimName: private-data-rw
+          - name: olympus-pretraining-ro-volume
+            persistentVolumeClaim:
+              claimName: olympus-pretraining-ro
+          - name: agi-cons-ro-volume
+            persistentVolumeClaim:
+              claimName: agi-cons-ro
+          - hostPath:
+              path: /dev/shm
+              type: Directory
+            name: shm
+          - hostPath:
+              path: /var/log/aws/clusters
+              type: DirectoryOrCreate
+            name: aws-clusters-logs

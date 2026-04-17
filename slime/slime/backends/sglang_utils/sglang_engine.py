@@ -18,6 +18,10 @@ from slime.utils.http_utils import get_host_info
 
 logger = logging.getLogger(__name__)
 
+# All HTTP calls in this module target local SGLang / router servers on the
+# same cluster node.  Bypass HTTP_PROXY so requests aren't routed externally.
+_NO_PROXY = {"http": None, "https": None}
+
 
 def get_base_gpu_id(args, rank):
     num_gpus = min(args.num_gpus_per_node, args.rollout_num_gpus_per_engine)
@@ -55,17 +59,28 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
 
     multiprocessing.set_start_method("spawn", force=True)
     server_args.host = server_args.host.strip("[]")
+    logger.info(
+        f"[DEBUG] launch_server_process: spawning SGLang server "
+        f"host={server_args.host} port={server_args.port} "
+        f"tp_size={server_args.tp_size} base_gpu_id={server_args.base_gpu_id} "
+        f"disable_cuda_graph={server_args.disable_cuda_graph} "
+        f"node_rank={server_args.node_rank}"
+    )
     p = multiprocessing.Process(target=launch_server, args=(server_args,))
     p.start()
+    logger.info(f"[DEBUG] launch_server_process: process started pid={p.pid}, node_rank={server_args.node_rank}")
 
     if server_args.node_rank != 0:
         return
 
+    logger.info(f"[DEBUG] launch_server_process: waiting for health check at {server_args.url()}")
+    _t0 = time.time()
     _wait_server_healthy(
         base_url=server_args.url(),
         api_key=server_args.api_key,
         is_process_alive=lambda: p.is_alive(),
     )
+    logger.info(f"[DEBUG] launch_server_process: server healthy after {time.time() - _t0:.1f}s")
 
     return p
 
@@ -75,12 +90,19 @@ def _wait_server_healthy(base_url, api_key, is_process_alive):
         "Content-Type": "application/json; charset=utf-8",
         "Authorization": f"Bearer {api_key}",
     }
+    _t0 = time.time()
+    _polls = 0
 
+    # trust_env=False bypasses HTTP_PROXY / NO_PROXY — the SGLang server
+    # is always on the local node, so proxying is never correct here.
     with requests.Session() as session:
+        session.trust_env = False
         while True:
+            _polls += 1
             try:
                 response = session.get(f"{base_url}/health_generate", headers=headers)
                 if response.status_code == 200:
+                    logger.info(f"[DEBUG] _wait_server_healthy: /health_generate OK after {_polls} polls ({time.time() - _t0:.1f}s)")
                     break
             except requests.RequestException:
                 pass
@@ -88,13 +110,17 @@ def _wait_server_healthy(base_url, api_key, is_process_alive):
             if not is_process_alive():
                 raise Exception("Server process terminated unexpectedly.")
 
+            if _polls % 15 == 0:
+                logger.info(f"[DEBUG] _wait_server_healthy: still waiting for {base_url}/health_generate ({_polls} polls, {time.time() - _t0:.1f}s)")
+
             time.sleep(2)
 
-        # use flush_cache to make sure the working queue is empty, so that we can do offload
+        _t1 = time.time()
         while True:
             try:
                 response = session.get(f"{base_url}/flush_cache", headers=headers)
                 if response.status_code == 200:
+                    logger.info(f"[DEBUG] _wait_server_healthy: /flush_cache OK ({time.time() - _t1:.1f}s)")
                     break
 
             except requests.RequestException:
@@ -122,6 +148,12 @@ class SGLangEngine(RayActor):
         self.engine_role = engine_role
 
     def init(self, dist_init_addr, port, nccl_port, host=None, disaggregation_bootstrap_port=None):
+        logger.info(
+            f"[DEBUG] SGLangEngine.init: rank={self.rank} base_gpu_id={self.base_gpu_id} "
+            f"host={host} port={port} nccl_port={nccl_port} dist_init_addr={dist_init_addr} "
+            f"role={self.engine_role} worker_type={self.worker_type}"
+        )
+        _init_t0 = time.time()
         if self.engine_role == "prm":
             self.router_ip = self.args.prm_router_ip
             self.router_port = self.args.prm_router_port
@@ -166,12 +198,13 @@ class SGLangEngine(RayActor):
             self._init_external(server_args_dict, external_engine_need_check_fields=external_engine_need_check_fields)
         else:
             self._init_normal(server_args_dict)
+        logger.info(f"[DEBUG] SGLangEngine.init: rank={self.rank} DONE in {time.time() - _init_t0:.1f}s")
 
     def _init_external(self, expect_server_args, external_engine_need_check_fields):
         logger.info(f"Use external SGLang engine (rank={self.rank}, expect_server_args={expect_server_args})")
 
         def _get_actual_server_args():
-            response = requests.get(f"http://{self.server_host}:{self.server_port}/get_server_info")
+            response = requests.get(f"http://{self.server_host}:{self.server_port}/get_server_info", proxies=_NO_PROXY)
             response.raise_for_status()
             return response.json()
 
@@ -193,7 +226,14 @@ class SGLangEngine(RayActor):
 
     def _init_normal(self, server_args_dict):
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
+        logger.info(
+            f"[DEBUG] _init_normal: rank={self.rank} base_gpu_id={server_args_dict.get('base_gpu_id')} "
+            f"tp_size={server_args_dict.get('tp_size')} "
+            f"disable_cuda_graph={server_args_dict.get('disable_cuda_graph', False)}"
+        )
+        _t0 = time.time()
         self.process = launch_server_process(ServerArgs(**server_args_dict))
+        logger.info(f"[DEBUG] _init_normal: rank={self.rank} server process ready in {time.time() - _t0:.1f}s")
 
         if self.node_rank == 0 and self.router_ip and self.router_port:
             if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_slime_router:
@@ -201,7 +241,8 @@ class SGLangEngine(RayActor):
                     self.worker_type == "regular"
                 ), "pd disaggregation is not supported in old router or slime router."
                 response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/add_worker?url=http://{self.server_host}:{self.server_port}"
+                    f"http://{self.router_ip}:{self.router_port}/add_worker?url=http://{self.server_host}:{self.server_port}",
+                    proxies=_NO_PROXY,
                 )
             else:
                 payload = {
@@ -213,8 +254,10 @@ class SGLangEngine(RayActor):
                 response = requests.post(
                     f"http://{self.router_ip}:{self.router_port}/workers",
                     json=payload,
+                    proxies=_NO_PROXY,
                 )
             response.raise_for_status()
+            logger.info(f"[DEBUG] _init_normal: rank={self.rank} registered with router at {self.router_ip}:{self.router_port}")
 
     def _make_request(self, endpoint: str, payload: dict | None = None):
         """Make a POST request to the specified endpoint with the given payload.
@@ -230,7 +273,7 @@ class SGLangEngine(RayActor):
             return
 
         url = f"http://{self.server_host}:{self.server_port}/{endpoint}"
-        response = requests.post(url, json=payload or {})
+        response = requests.post(url, json=payload or {}, proxies=_NO_PROXY)
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
@@ -256,6 +299,7 @@ class SGLangEngine(RayActor):
         response = requests.get(
             f"http://{self.server_host}:{self.server_port}/health_generate",
             timeout=timeout,
+            proxies=_NO_PROXY,
         )
         response.raise_for_status()
         return True
@@ -292,7 +336,7 @@ class SGLangEngine(RayActor):
         # flush cache will not return status_code 200 when there are pending requests
         for _ in range(60):
             try:
-                response = requests.get(f"http://{self.server_host}:{self.server_port}/flush_cache")
+                response = requests.get(f"http://{self.server_host}:{self.server_port}/flush_cache", proxies=_NO_PROXY)
                 if response.status_code == 200:
                     break
             except NewConnectionError as e:
@@ -314,19 +358,21 @@ class SGLangEngine(RayActor):
             response = None
             if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_slime_router:
                 response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/remove_worker?url=http://{self.server_host}:{self.server_port}"
+                    f"http://{self.router_ip}:{self.router_port}/remove_worker?url=http://{self.server_host}:{self.server_port}",
+                    proxies=_NO_PROXY,
                 )
             elif parse(sglang_router.__version__) < parse("0.3.0"):
                 worker_url = quote(worker_url, safe="")
-                response = requests.delete(f"http://{self.router_ip}:{self.router_port}/workers/{worker_url}")
+                response = requests.delete(f"http://{self.router_ip}:{self.router_port}/workers/{worker_url}", proxies=_NO_PROXY)
             else:
                 try:
-                    all_workers = requests.get(f"http://{self.router_ip}:{self.router_port}/workers").json()["workers"]
+                    all_workers = requests.get(f"http://{self.router_ip}:{self.router_port}/workers", proxies=_NO_PROXY).json()["workers"]
                     for worker in all_workers:
                         if worker["url"] == worker_url:
                             worker_id = worker["id"]
                             response = requests.delete(
-                                f"http://{self.router_ip}:{self.router_port}/workers/{worker_id}"
+                                f"http://{self.router_ip}:{self.router_port}/workers/{worker_id}",
+                                proxies=_NO_PROXY,
                             )
                             break
                     else:
@@ -342,7 +388,7 @@ class SGLangEngine(RayActor):
         if self.node_rank != 0:
             return
         url = f"http://{self.server_host}:{self.server_port}/get_weight_version"
-        response = requests.get(url)
+        response = requests.get(url, proxies=_NO_PROXY)
         response.raise_for_status()
         return response.json()["weight_version"]
 
@@ -405,12 +451,12 @@ class SGLangEngine(RayActor):
         )
 
     def pause_generation(self):
-        response = requests.post(f"http://{self.server_host}:{self.server_port}/pause_generation", json={})
+        response = requests.post(f"http://{self.server_host}:{self.server_port}/pause_generation", json={}, proxies=_NO_PROXY)
         response.raise_for_status()
         return response
 
     def continue_generation(self):
-        response = requests.post(f"http://{self.server_host}:{self.server_port}/continue_generation", json={})
+        response = requests.post(f"http://{self.server_host}:{self.server_port}/continue_generation", json={}, proxies=_NO_PROXY)
         response.raise_for_status()
         return response
 
@@ -458,12 +504,13 @@ class SGLangEngine(RayActor):
                 "with_stack": with_stack,
                 "record_shapes": record_shapes,
             },
+            proxies=_NO_PROXY,
         )
         response.raise_for_status()
         return response
 
     def stop_profile(self):
-        response = requests.post(f"http://{self.server_host}:{self.server_port}/stop_profile", json={})
+        response = requests.post(f"http://{self.server_host}:{self.server_port}/stop_profile", json={}, proxies=_NO_PROXY)
         response.raise_for_status()
         return response
 

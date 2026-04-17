@@ -1,0 +1,170 @@
+# =============================================================================
+# Trainer pool — 4B Qwen (slime + Megatron-LM)
+# =============================================================================
+# Mirrors Kiro's slime_train_async_debug_run.yaml. Waits for the SGLang pool
+# AND the CPU agent-worker pool to write their env files, then starts its own
+# Ray cluster and runs train.py with --rollout-external.
+# =============================================================================
+apiVersion: "kubeflow.org/v1"
+kind: "PyTorchJob"
+metadata:
+  name: swerl-4b-trainer
+  namespace: hyperpod-ns-aladdin
+  labels:
+    kueue.x-k8s.io/queue-name: hyperpod-ns-aladdin-localqueue
+    kueue.x-k8s.io/priority-class: high-p5-priority
+spec:
+  pytorchReplicaSpecs:
+    Worker:
+      replicas: 2                               # 2 × 8 GPU = 16 GPU for 4B training
+      restartPolicy: OnFailure
+      template:
+        metadata:
+          labels:
+            kueue.x-k8s.io/queue-name: hyperpod-ns-aladdin-localqueue
+            kueue.x-k8s.io/priority-class: high-p5-priority
+        spec:
+          serviceAccountName: bedrock-sa
+          nodeSelector:
+            beta.kubernetes.io/instance-type: ml.p5.48xlarge
+            sagemaker.amazonaws.com/node-health-status: Schedulable
+            sagemaker.amazonaws.com/deep-health-check-status: Passed
+          containers:
+          - name: pytorch
+            image: 975050351917.dkr.ecr.us-east-2.amazonaws.com/q-codegen:swerl-aws-kiro-0.1.0
+            imagePullPolicy: Always
+            command: ["bash", "-c"]
+            args:
+              - |
+                set -ex
+                set -o pipefail
+
+                SGLANG_ENV_FILE="${SGLANG_ENV_BASE}/${SGLANG_RUN_NAME}/sglang_external_rollout.env"
+                AGENT_ENV_FILE="${SGLANG_ENV_BASE}/${SWE_AGENT_RUN_NAME}/swe_agents.env"
+
+                # Wait for BOTH coordination files
+                for F in "${SGLANG_ENV_FILE}" "${AGENT_ENV_FILE}"; do
+                  echo "Waiting for $F ..."
+                  WAITED=0
+                  while [ ! -f "${F}" ]; do
+                    if [ "${WAITED}" -ge 1800 ]; then
+                      echo "ERROR: timeout waiting for ${F}"; exit 1
+                    fi
+                    sleep 10; WAITED=$((WAITED + 10))
+                    [ $((WAITED % 60)) -eq 0 ] && echo "  still waiting (${WAITED}s)..."
+                  done
+                  echo "Found ${F}:"; cat "${F}"
+                done
+
+                source "${AGENT_ENV_FILE}"
+                export SWE_AGENT_URLS
+                echo "SWE_AGENT_URLS=${SWE_AGENT_URLS}"
+
+                rm -rf /dev/shm/containerd /dev/shm/containers /dev/shm/docker_data
+                rm -rf /dev/shm/buildkit /dev/shm/rootfs /dev/shm/volumes
+                rm -rf /dev/shm/plugins /dev/shm/network /dev/shm/swarm
+                rm -rf /dev/shm/tmp /dev/shm/runtimes
+                rm -f /dev/shm/engine-id /dev/shm/nccl-*
+
+                LOG_DIR="/mnt_out/${USER:-default}/logs/swerl-aws-kiro/trainer/${RUN_NAME}"
+                mkdir -p "${LOG_DIR}"
+                LOG_FILE="${LOG_DIR}/$(hostname)_$(date +%Y%m%d_%H%M%S).log"
+                bash ${AWS_KIRO_DIR}/scripts/run_swe_rl_4b_kiro_trainer.sh 2>&1 | tee "${LOG_FILE}"
+            env:
+            - name: RUN_NAME
+              value: "swerl_4b_train"
+            # ★ MUST match SGLang job's RUN_NAME (launch_sglang_4b.yaml)
+            - name: SGLANG_RUN_NAME
+              value: "swerl_4b_sglang"
+            # ★ MUST match CPU agent-worker job's RUN_NAME (launch_swe_agent_workers.yaml)
+            - name: SWE_AGENT_RUN_NAME
+              value: "swerl_swe_agents"
+            - name: SGLANG_ENV_BASE
+              value: "/mnt_out/jinxiaolong/logs/swerl-aws-kiro"
+            # --- Paths ---
+            - name: SLIME_DIR
+              value: "/mnt_out/jinxiaolong/codebase/slime"
+            - name: AWS_KIRO_DIR
+              value: "/mnt_out/jinxiaolong/codebase/slime/examples/aws_kiro_infra"
+            - name: MEGATRON_LM_PATH
+              value: "/mnt_out/jinxiaolong/codebase/Megatron-LM"
+            - name: EXPORT_ROOT
+              value: "/mnt_out/jinxiaolong/ckpt/swerl-aws-kiro"
+            # --- Model / data ---
+            - name: HF_CKPT
+              value: "/mnt_out/jinxiaolong/models/Qwen3-4B-Instruct-2507"
+            - name: PROMPT_DATA
+              value: "/mnt_out/jinxiaolong/data/preprocessed_sweap_582_v8.0_train.parquet"
+            # --- 4B hyperparameters (kept per user request, NOT aligned to 30B Kiro recipe) ---
+            - name: NUM_ROLLOUT
+              value: "500"
+            - name: ROLLOUT_BATCH_SIZE
+              value: "4"
+            - name: N_SAMPLES_PER_PROMPT
+              value: "4"
+            - name: ROLLOUT_MAX_RESPONSE_LEN
+              value: "4096"
+            - name: ROLLOUT_MAX_CONTEXT_LEN
+              value: "32768"
+            - name: LR
+              value: "1e-6"
+            - name: SAVE_INTERVAL
+              value: "10"
+            - name: TENSOR_MODEL_PARALLEL_SIZE
+              value: "4"
+            - name: PIPELINE_MODEL_PARALLEL_SIZE
+              value: "1"
+            - name: CONTEXT_PARALLEL_SIZE
+              value: "1"
+            - name: MAX_TOKENS_PER_GPU
+              value: "9216"
+            # --- Aux judge (trainer-side litellm call per trajectory) ---
+            - name: AUX_REWARD_COEF
+              value: "0.5"
+            - name: AUX_JUDGE_MODEL
+              value: "openai/gpt-4o-mini"
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: openai-api-key
+                  key: api-key
+            # --- SWE rollout tuning ---
+            - name: SWE_MAX_CONCURRENT
+              value: "128"
+            - name: SWE_ROLLOUT_TIMEOUT
+              value: "1800"
+            - name: SWE_EVAL_TIMEOUT
+              value: "300"
+            - name: PET_NNODES
+              value: "2"
+            - name: NCCL_TIMEOUT
+              value: "12000"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PYTORCH_ALLOC_CONF
+              value: "expandable_segments:True"
+            resources:
+              limits:
+                nvidia.com/gpu: "8"
+                vpc.amazonaws.com/efa: "32"
+              requests:
+                nvidia.com/gpu: "8"
+                vpc.amazonaws.com/efa: "32"
+            volumeMounts:
+            - mountPath: /mnt_out
+              name: private-model-rw-volume
+            - mountPath: /mnt_private
+              name: private-data-ro-volume
+            - mountPath: /dev/shm
+              name: shm
+          volumes:
+          - name: private-model-rw-volume
+            persistentVolumeClaim:
+              claimName: private-model-rw
+          - name: private-data-ro-volume
+            persistentVolumeClaim:
+              claimName: private-data-rw
+          - hostPath:
+              path: /dev/shm
+              type: Directory
+            name: shm

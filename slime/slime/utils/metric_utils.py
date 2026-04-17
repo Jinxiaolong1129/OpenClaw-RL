@@ -24,7 +24,29 @@ def compute_pass_rate(
 
     pass_rate_name_list = [2**i for i in range(int(math.log2(group_size)) + 1)]
 
-    assert len(flat_rewards) == num_groups * group_size, f"{len(flat_rewards)=} {num_groups=} {group_size=}"
+    expected_size = num_groups * group_size
+    if len(flat_rewards) != expected_size:
+        inferred_num_groups = len(flat_rewards) // group_size
+        usable_size = inferred_num_groups * group_size
+        dropped = len(flat_rewards) - usable_size
+
+        logger.warning(
+            "compute_pass_rate shape mismatch: len(flat_rewards)=%d, num_groups=%d, group_size=%d, "
+            "expected=%d. Falling back to inferred_num_groups=%d (usable_size=%d, dropped=%d).",
+            len(flat_rewards),
+            num_groups,
+            group_size,
+            expected_size,
+            inferred_num_groups,
+            usable_size,
+            dropped,
+        )
+
+        if inferred_num_groups <= 0:
+            return {}
+        num_groups = inferred_num_groups
+        flat_rewards = flat_rewards[:usable_size]
+
     rewards_of_group = np.array(flat_rewards).reshape(num_groups, group_size)
 
     log_dict = {}

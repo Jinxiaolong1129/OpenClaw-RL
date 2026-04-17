@@ -1,0 +1,192 @@
+apiVersion: "kubeflow.org/v1"
+kind: "PyTorchJob"
+metadata:
+  name: myshang-slime-async-interval-3-0220-exec
+  namespace: hyperpod-ns-aladdin
+  labels:
+    kueue.x-k8s.io/queue-name: hyperpod-ns-aladdin-localqueue
+    kueue.x-k8s.io/priority-class: high-p5-priority
+spec:
+  pytorchReplicaSpecs:
+    Worker:
+      replicas: 16
+      restartPolicy: OnFailure
+      template:
+        metadata:
+          labels:
+            kueue.x-k8s.io/queue-name: hyperpod-ns-aladdin-localqueue
+            kueue.x-k8s.io/priority-class: high-p5-priority
+        spec:
+          serviceAccountName: bedrock-sa
+          nodeSelector:
+            beta.kubernetes.io/instance-type: ml.p5.48xlarge
+            sagemaker.amazonaws.com/node-health-status: Schedulable
+            sagemaker.amazonaws.com/deep-health-check-status: Passed
+          # affinity:
+          #   nodeAffinity:
+          #     requiredDuringSchedulingIgnoredDuringExecution:
+          #       nodeSelectorTerms:
+          #       - matchExpressions:
+          #         - key: kubernetes.io/hostname
+          #           operator: NotIn
+          #           values:
+          #             - hyperpod-i-0c8e8d06a97b1d7b6
+          #           - hyperpod-i-0cd2cd2044a70de7e
+          #           - hyperpod-i-0a07f3e6e351ee573
+          #           - hyperpod-i-0a4bb40760b477bc6
+          #           - hyperpod-i-007e4e6cbb60ba0c0
+          #           - hyperpod-i-0aae0f11d55d41ed2
+          containers:
+          - name: pytorch
+            image: 975050351917.dkr.ecr.us-east-2.amazonaws.com/q-codegen:myshang-slime-0.2.2-kos-mlflow
+            imagePullPolicy: Always
+            securityContext:
+              privileged: true
+            command: ["bash", "-c"]
+            args:
+              - |
+                set -ex
+                export SGLANG_ENV_FILE=${SGLANG_ENV_BASE}/${SGLANG_RUN_NAME}/sglang_external_rollout.env
+                if [ ! -f "$SGLANG_ENV_FILE" ]; then
+                  echo "ERROR: SGLANG_ENV_FILE not found at $SGLANG_ENV_FILE"
+                  echo "Make sure the SGLang server job is running and has written this file."
+                  exit 1
+                fi
+                echo "Found SGLang env file:"
+                cat "$SGLANG_ENV_FILE"
+
+                echo "Cleaning up /dev/shm before Docker startup..."
+                echo "Before cleanup: $(du -sh /dev/shm/ 2>/dev/null | cut -f1)"
+                rm -rf /dev/shm/containerd
+                rm -rf /dev/shm/containers
+                rm -rf /dev/shm/docker_data
+                rm -rf /dev/shm/buildkit
+                rm -rf /dev/shm/rootfs
+                rm -rf /dev/shm/volumes
+                rm -rf /dev/shm/plugins
+                rm -rf /dev/shm/network
+                rm -rf /dev/shm/swarm
+                rm -rf /dev/shm/tmp
+                rm -rf /dev/shm/runtimes
+                rm -f /dev/shm/engine-id
+                rm -f /dev/shm/nccl-*
+                echo "After cleanup: $(du -sh /dev/shm/ 2>/dev/null | cut -f1)"
+                LOG_DIR="/mnt_out/myshang/logs/slime/trainer/${RUN_NAME}"
+                mkdir -p "${LOG_DIR}/logs"
+                HOSTNAME=$(hostname)
+                LOG_FILE="${LOG_DIR}/logs/${HOSTNAME}_$(date +%Y%m%d_%H%M%S).log"
+                echo "Logging to: ${LOG_FILE}"
+                bash ${SLIME_DIR}/examples/kiro_agent/run-qwen3-30b-kiro-kos-async.sh 2>&1 | tee "${LOG_FILE}"
+            env:
+            - name: NCCL_TIMEOUT
+              value: "12000"
+            - name: MODEL_PATH
+              value: "/mnt_out/myshang/models/qwen/Qwen3-Coder-30B-A3B-Instruct"
+            - name: ROUTER_PORT
+              value: "30000"
+            - name: MAX_TOTAL_TOKENS
+              value: "131072"
+            - name: SLIME_DIR
+              value: "/mnt_out/myshang/codebase/slime"
+            - name: LOG_DIR
+              value: "/mnt_out/myshang/logs/slime"
+            - name: RUN_NAME
+              value: "async_0220_interval_3_exec"
+            - name: SGLANG_RUN_NAME
+              value: "async_0220"
+            - name: SGLANG_ENV_BASE
+              value: "/mnt_out/myshang/logs/slime"
+            - name: KOS_TIMEOUT
+              value: "3600"
+            - name: TRAJECTORY_FOLDER
+              value: "/mnt_out/myshang/logs/slime/trajectory_folder"
+            - name: VALIDATE_SHARD_MAP_DIR
+              value: "/mnt_out/tiayuche/validate_service/tiayuche_validate_cpu/shard_maps"
+            - name: VALIDATE_SERVICE_PORT
+              value: "51429"
+            - name: VALIDATE_TIMEOUT
+              value: "1200"
+            - name: VALIDATE_SERVICE_NAMESPACE
+              value: "hyperpod-ns-aladdin"
+            - name: UPDATE_WEIGHTS_INTERVAL
+              value: "3"
+            # --- Performance / Parallelism ---
+            - name: TENSOR_MODEL_PARALLEL_SIZE
+              value: "4"
+            - name: PIPELINE_MODEL_PARALLEL_SIZE
+              value: "2"
+            - name: CONTEXT_PARALLEL_SIZE
+              value: "8"
+            - name: EXPERT_MODEL_PARALLEL_SIZE
+              value: "8"
+            - name: RECOMPUTE_GRANULARITY
+              value: "full"
+            - name: RECOMPUTE_METHOD
+              value: "uniform"
+            - name: RECOMPUTE_NUM_LAYERS
+              value: "4"
+            - name: USE_DYNAMIC_BATCH_SIZE
+              value: "true"
+            - name: MAX_TOKENS_PER_GPU
+              value: "49152"
+            - name: LOG_PROBS_MAX_TOKENS_PER_GPU
+              value: "81920"
+            - name: MLFLOW_TRACKING_URI
+              value: arn:aws:sagemaker:us-east-1:605134433731:mlflow-tracking-server/aladdin-iad
+            - name: TRACKING_SERVER_URI
+              value: arn:aws:sagemaker:us-east-1:605134433731:mlflow-tracking-server/aladdin-iad
+            - name: MLFLOW_EXPERIMENT_NAME
+              value: "slime-kos-smoke-test-async"
+            - name: MLFLOW_RUN_NAME
+              value: "qwen3-30b-kos-smoke-test-async"
+            - name: PYTORCH_ALLOC_CONF
+              value: "expandable_segments:True"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            resources:
+              limits:
+                nvidia.com/gpu: "8"
+                vpc.amazonaws.com/efa: "32"
+              requests:
+                nvidia.com/gpu: "8"
+                vpc.amazonaws.com/efa: "32"
+            volumeMounts:
+            - mountPath: /mnt
+              name: public-data-ro-volume
+            - mountPath: /mnt_out
+              name: private-model-rw-volume
+            - mountPath: /mnt_private
+              name: private-data-ro-volume
+            - mountPath: /mnt_agi_data
+              name: olympus-pretraining-ro-volume
+            - mountPath: /mnt_agi_cons
+              name: agi-cons-ro-volume
+            - mountPath: /dev/shm
+              name: shm
+            - mountPath: /var/log/aws/clusters
+              name: aws-clusters-logs
+              readOnly: true
+          volumes:
+          - name: public-data-ro-volume
+            persistentVolumeClaim:
+              claimName: public-data-ro
+          - name: private-model-rw-volume
+            persistentVolumeClaim:
+              claimName: private-model-rw
+          - name: private-data-ro-volume
+            persistentVolumeClaim:
+              claimName: private-data-rw
+          - name: olympus-pretraining-ro-volume
+            persistentVolumeClaim:
+              claimName: olympus-pretraining-ro
+          - name: agi-cons-ro-volume
+            persistentVolumeClaim:
+              claimName: agi-cons-ro
+          - hostPath:
+              path: /dev/shm
+              type: Directory
+            name: shm
+          - hostPath:
+              path: /var/log/aws/clusters
+              type: DirectoryOrCreate
+            name: aws-clusters-logs

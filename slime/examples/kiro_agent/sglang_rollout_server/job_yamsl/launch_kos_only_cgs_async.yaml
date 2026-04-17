@@ -1,0 +1,184 @@
+apiVersion: "kubeflow.org/v1"
+kind: "PyTorchJob"
+metadata:
+  name: yawenwuu-slime-kos-cgs-server
+  namespace: hyperpod-ns-aladdin
+  labels:
+    kueue.x-k8s.io/queue-name: hyperpod-ns-aladdin-localqueue
+    kueue.x-k8s.io/priority-class: high-p5-priority
+spec:
+  pytorchReplicaSpecs:
+    Worker:
+      replicas: 80  # CPU nodes for KoS agent servers (CGS mode)
+      restartPolicy: OnFailure
+      template:
+        metadata:
+          labels:
+            kueue.x-k8s.io/queue-name: hyperpod-ns-aladdin-localqueue
+            kueue.x-k8s.io/priority-class: high-p5-priority
+        spec:
+          serviceAccountName: bedrock-sa
+          nodeSelector:
+            beta.kubernetes.io/instance-type: ml.m5.24xlarge
+            sagemaker.amazonaws.com/node-health-status: Schedulable
+          containers:
+          - name: pytorch
+            image: 975050351917.dkr.ecr.us-east-2.amazonaws.com/q-codegen:myshang-kos-server-0227
+            imagePullPolicy: Always
+            securityContext:
+              privileged: true  # Needed for Docker-in-Docker (CGS tasks)
+            command: ["bash", "-c"]
+            args:
+              - |
+                set -o pipefail
+                set -x
+
+                LOG_DIR="/mnt_out/yawenwuu/logs/slime/kos/${RUN_NAME}"
+                mkdir -p "${LOG_DIR}/logs"
+                HOSTNAME=$(hostname)
+                LOG_FILE="${LOG_DIR}/logs/${HOSTNAME}_kos_$(date +%Y%m%d_%H%M%S).log"
+                echo "Logging to: ${LOG_FILE}"
+
+                # Clean up /dev/shm before Docker startup
+                echo "Cleaning up /dev/shm before Docker startup..."
+                echo "Before cleanup: $(du -sh /dev/shm/ 2>/dev/null | cut -f1)"
+                rm -rf /dev/shm/containerd
+                rm -rf /dev/shm/containers
+                rm -rf /dev/shm/docker_data
+                rm -rf /dev/shm/buildkit
+                rm -rf /dev/shm/rootfs
+                rm -rf /dev/shm/volumes
+                rm -rf /dev/shm/plugins
+                rm -rf /dev/shm/network
+                rm -rf /dev/shm/swarm
+                rm -rf /dev/shm/tmp
+                rm -rf /dev/shm/runtimes
+                rm -f /dev/shm/engine-id
+                rm -f /dev/shm/nccl-*
+                echo "After cleanup: $(du -sh /dev/shm/ 2>/dev/null | cut -f1)"
+
+                bash ${SLIME_DIR}/examples/kiro_agent/sglang_rollout_server/launch_kos_only.sh \
+                  --sglang-env-file "${SGLANG_ENV_BASE}/${SGLANG_RUN_NAME}/sglang_external_rollout.env" \
+                  --model-path "${MODEL_PATH}" \
+                  --kos-home "${KOS_HOME}" \
+                  --kos-workspace-path "${KOS_WORKSPACE_PATH}" \
+                  --kos-is-swe-task false \
+                  --kos-is-cgs-task true \
+                  --kos-cgs-docker-image "${KOS_CGS_DOCKER_IMAGE}" \
+                  --kos-cgs-docker-tar "${KOS_CGS_DOCKER_TAR}" \
+                  --kos-cgs-tarball-base "${KOS_CGS_TARBALL_BASE}" \
+                  --kos-num-workers "${KOS_NUM_WORKERS}" \
+                  --kos-max-concurrent-agents "${KOS_MAX_CONCURRENT_AGENTS}" \
+                  --kos-max-iterations "${KOS_MAX_ITERATIONS}" \
+                  --kos-timeout "${KOS_TIMEOUT}" \
+                  --kos-use-agent-judge "${KOS_USE_AGENT_JUDGE}" \
+                  --kos-use-judge-as-reward "${KOS_USE_JUDGE_AS_REWARD}" \
+                  --kos-judge-trajectory-mode "${KOS_JUDGE_TRAJECTORY_MODE}" \
+                  --kos-judge-model-config "${KOS_JUDGE_MODEL_CONFIG}" \
+                  --kos-max-tool-calls-per-turn "${KOS_MAX_TOOL_CALLS_PER_TURN}" \
+                  --run-name "${RUN_NAME}" \
+                  --output-dir /mnt_out/yawenwuu/logs/slime \
+                  2>&1 | tee "${LOG_FILE}"
+
+                echo "Script exited with code $?. Sleeping to keep pod alive for debugging."
+                sleep infinity
+            env:
+            # --- SGLang connection (points to GPU job's env file) ---
+            - name: SGLANG_ENV_BASE
+              value: "/mnt_out/yawenwuu/logs/slime"
+            - name: SGLANG_RUN_NAME
+              value: "sglang_server_cgs"
+            # --- Model (for DEFAULT_MODEL_PATH env in KoS) ---
+            - name: MODEL_PATH
+              value: "/mnt_out/yawenwuu/models/qwen/Qwen3-Coder-30B-A3B-Instruct"
+            # --- KoS ---
+            - name: KOS_HOME
+              value: "/mnt_out/yawenwuu/packages/rl_test_repo/Kiro-on-Strands/src/Kiro-on-Strands"
+            - name: KOS_WORKSPACE_PATH
+              value: "/mnt_out/yawenwuu/cgs/repos_workspace"
+            - name: KOS_CGS_DOCKER_IMAGE
+              value: "python-cgs:3.12-slim"
+            - name: KOS_CGS_DOCKER_TAR
+              value: "/mnt_out/yawenwuu/cgs/dockers/python-cgs-3.12-slim.tar"
+            - name: KOS_CGS_TARBALL_BASE
+              value: "/mnt_out/zhenglee/data/synthetic_trajectory_enriched/repos"
+            - name: KOS_NUM_WORKERS
+              value: "4"
+            - name: KOS_MAX_CONCURRENT_AGENTS
+              value: "4"
+            - name: KOS_MAX_ITERATIONS
+              value: "60"
+            - name: KOS_TIMEOUT
+              value: "1800"
+            # --- Agent-as-Judge ---
+            - name: KOS_USE_AGENT_JUDGE
+              value: "true"
+            - name: KOS_USE_JUDGE_AS_REWARD
+              value: "true"
+            - name: KOS_JUDGE_TRAJECTORY_MODE
+              value: "true"
+            - name: KOS_JUDGE_MODEL_CONFIG
+              value: "opus_v4.6"
+            - name: KOS_MAX_TOOL_CALLS_PER_TURN
+              value: "0"
+            - name: METRICS_MAX_RESPONSE_LENGTH
+              value: "98304"
+            # --- Metrics (must match VeRL) ---
+            - name: KOS_TARGET_PATCH_COLUMN
+              value: "expected_groundtruth_files"
+            - name: KOS_METRICS_MAX_TRAJECTORY_LENGTH
+              value: "131072"
+            # --- General ---
+            - name: RUN_NAME
+              value: "kos_cgs_server"
+            - name: SLIME_DIR
+              value: "/mnt_out/yawenwuu/packages/rl_test_repo/slime"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: MAX_CACHED_IMAGES
+              value: "10"
+            resources:
+              requests:
+                memory: "200Gi"
+              limits:
+                memory: "300Gi"
+            volumeMounts:
+            - mountPath: /mnt
+              name: public-data-ro-volume
+            - mountPath: /mnt_out
+              name: private-model-rw-volume
+            - mountPath: /mnt_private
+              name: private-data-ro-volume
+            - mountPath: /mnt_agi_data
+              name: olympus-pretraining-ro-volume
+            - mountPath: /mnt_agi_cons
+              name: agi-cons-ro-volume
+            - mountPath: /dev/shm
+              name: shm
+            - mountPath: /var/log/aws/clusters
+              name: aws-clusters-logs
+              readOnly: true
+          volumes:
+          - name: public-data-ro-volume
+            persistentVolumeClaim:
+              claimName: public-data-ro
+          - name: private-model-rw-volume
+            persistentVolumeClaim:
+              claimName: private-model-rw
+          - name: private-data-ro-volume
+            persistentVolumeClaim:
+              claimName: private-data-rw
+          - name: olympus-pretraining-ro-volume
+            persistentVolumeClaim:
+              claimName: olympus-pretraining-ro
+          - name: agi-cons-ro-volume
+            persistentVolumeClaim:
+              claimName: agi-cons-ro
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 180Gi
+          - hostPath:
+              path: /var/log/aws/clusters
+              type: DirectoryOrCreate
+            name: aws-clusters-logs
