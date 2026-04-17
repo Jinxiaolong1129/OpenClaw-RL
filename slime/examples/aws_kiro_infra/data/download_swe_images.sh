@@ -29,7 +29,7 @@
 # Env overrides:
 #   PROXY_PREFIX_SWE_GYM, PROXY_PREFIX_SWE_BENCH   — registry mirror hostnames
 #   MAX_RETRIES, RETRY_SLEEP                       — pull retry policy
-#   PARALLEL                                        — parallel downloads (default 4)
+#   PARALLEL                                        — parallel downloads (default 20)
 #   KEEP_LOCAL_IMAGE                                — 1 = keep in dockerd after save
 # =============================================================================
 
@@ -38,7 +38,7 @@ set -euo pipefail
 PROMPT_DATA=""
 OUTPUT_DIR=""
 MAX=0
-PARALLEL=${PARALLEL:-4}
+PARALLEL=${PARALLEL:-20}
 
 # Canonical image names (what CPU agent pod's `docker_ops.py` expects with --pull never).
 # These are the tags that end up inside the .tar.gz via `docker save`, so agent pods

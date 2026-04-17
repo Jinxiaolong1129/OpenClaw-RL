@@ -1,6 +1,6 @@
 # Teammate Quickstart — 一页纸上手 30B 训练
 
-> **★ 代码位置**：`/data_storage/wyj/jxl/OpenClaw-RL/slime/examples/aws_kiro_infra/`（按 slime examples 惯例）
+> **★ 代码位置**：`<SLIME_ROOT>/examples/aws_kiro_infra/`（按 slime examples 惯例）
 >
 > **PVC 部署路径**：`/mnt_out/<USER>/codebase/slime/examples/aws_kiro_infra/`
 
@@ -22,7 +22,7 @@
 ## Step 1：预处理数据（预处理机器上，一次性）
 
 ```bash
-cd /data_storage/wyj/jxl/slime/examples/aws_kiro_infra
+cd <SLIME_ROOT>/examples/aws_kiro_infra
 
 # ---- 环境 ----
 pip install datasets pandas pyarrow huggingface-hub
@@ -67,7 +67,7 @@ bash scripts/convert_hf_to_mcore.sh \
 验证整条 reward 链路能跑通（已在 orange3 上本地验证过）：
 
 ```bash
-cd /data_storage/wyj/jxl/slime/examples/aws_kiro_infra
+cd <SLIME_ROOT>/examples/aws_kiro_infra
 
 export HTTP_PROXY=http://100.68.168.184:3128
 export HTTPS_PROXY=http://100.68.168.184:3128
@@ -169,7 +169,7 @@ YAML 里的 `args` 已调用 `scripts/run_swe_rl_30b_rllm_trainer.sh`（rllm 变
 ## Step 5：kubectl apply（按顺序）
 
 ```bash
-cd /data_storage/wyj/jxl/slime/examples/aws_kiro_infra/k8s
+cd <SLIME_ROOT>/examples/aws_kiro_infra/k8s
 
 # 1. GPU SGLang 池 (8 pods, 加载 30B 模型 ~5 min)
 kubectl apply -f launch_sglang_30b.yaml
