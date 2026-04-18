@@ -1,4 +1,9 @@
 
+### Ops Notes
+
+- Server access and storage/docker status:
+  - `./SERVER_ACCESS_AND_STORAGE.md`
+
 ### Slime Env Setup
 
 ```bash

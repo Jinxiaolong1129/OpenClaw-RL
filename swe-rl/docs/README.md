@@ -58,6 +58,30 @@ cd <REPO_ROOT>
 bash swe-rl/eval/run_eval_swe.sh
 ```
 
+## Eval: 4B multi-node script
+
+```bash
+source activate <CONDA_ENV>
+set -a; source <ENV_FILE>; set +a
+
+# Optional: evaluate a specific checkpoint
+export HF_CKPT=<REPO_ROOT>/export/hf/swe-rl-4b_iter180
+
+cd <REPO_ROOT>
+bash swe-rl/scripts/eval_4b_4nodes.sh
+```
+
+`swe-rl/scripts/eval_4b_4nodes.sh` evaluation logic:
+
+- Starts remote SWE env pool server and joins Ray workers on 4 GPU nodes
+- Runs two eval passes in sequence:
+  - SWE-Bench Verified (`text/metadata` payload)
+  - SWE-Gym 293 (`prompt/instance` payload)
+- Each eval trajectory calls `generate_with_swe.generate` + `reward_func`
+- Cleans remote Docker containers between phases and writes artifacts to:
+  - `${EXPORT_ROOT}/swe_rollouts/eval_<run_tag>_verified_<ts>`
+  - `${EXPORT_ROOT}/swe_rollouts/eval_<run_tag>_swegym_<ts>`
+
 ## Train: 8 nodes (Qwen3-32B)
 
 ```bash

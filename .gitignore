@@ -5,3 +5,7 @@ swe-rl/scripts/logs
 swe.pem
 __pycache__/
 *.pyc
+ProRL-Agent-Server/
+SkyRL/
+rllm/
+mini-swe-agent/
